@@ -1,5 +1,7 @@
 # Rust
 /server/target/
+# Coverage (cargo-llvm-cov merged report — `just test coverage rs`). Lives under
+# the target/ ignore above as server/target/llvm-cov/; never committed.
 **/*.rs.bk
 
 # Node / Bun (React frontend)

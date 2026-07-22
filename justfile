@@ -35,6 +35,7 @@ help:
     @echo "🧪 Testing"
     @echo "   just test all          Run cargo test (all crates)"
     @echo "   just test crate <name> Test a single workspace crate"
+    @echo "   just test coverage     Line coverage (rs + ts); 'just test coverage' for detail"
     @echo ""
     @echo "🌲 Worktrees"
     @echo "   just wt add <name>     Create worktree + feature branch"

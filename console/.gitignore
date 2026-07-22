@@ -12,6 +12,10 @@ dist
 dist-ssr
 *.local
 
+# Coverage (bun test --coverage output — `just test coverage ts`).
+# The parser recomputes the denominator over src/** itself; never committed.
+coverage/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

@@ -221,3 +221,93 @@ jobs:
           path: server/target/release/heron
           retention-days: 7
           if-no-files-found: error
+
+  # ────────────────────────────────────────────────────────────────────────
+  # coverage — report-only. Publishes line coverage for both stacks and
+  # uploads the reports as artifacts, but NEVER fails the PR solely because
+  # coverage ≤ the baseline. The run steps are `continue-on-error: true` and
+  # the consolidated threshold step runs under `shell: bash {0}` so the
+  # percentage always surfaces in the log even when it's below the baseline.
+  # The local gate (`just test coverage gate`) is the enforcing tier; CI is
+  # the visibility tier. Kept a separate job so a coverage hiccup can't block
+  # the merge-critical `test` job.
+  coverage:
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, ci-pool]
+    timeout-minutes: 45
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain versions
+        run: |
+          cargo --version
+          rustc --version
+          bun --version
+          python3 --version
+
+      # cargo-llvm-cov + the llvm-tools-preview component are needed for the
+      # Rust stack. Idempotent on the pool host: the install is a fast no-op
+      # when already present.
+      - name: provision cargo-llvm-cov
+        run: |
+          rustup component add llvm-tools-preview
+          if ! cargo llvm-cov --version >/dev/null 2>&1; then
+            cargo install cargo-llvm-cov --locked
+          else
+            echo "cargo-llvm-cov already present: $(cargo llvm-cov --version)"
+          fi
+
+      # Report-only: continue-on-error so a tooling/runner hiccup or a
+      # below-baseline run never fails the job. The summary still prints the
+      # line %, per-crate summary, and worst-uncovered files to the log.
+      - name: rust coverage (cargo-llvm-cov, merged report)
+        continue-on-error: true
+        env:
+          CARGO_TERM_COLOR: always
+        run: bash scripts/coverage/run_coverage_rs.sh
+
+      - name: ts coverage (bun test --coverage)
+        continue-on-error: true
+        run: bash scripts/coverage/run_coverage_ts.sh
+
+      # Consolidated threshold step. `shell: bash {0}` makes the step always
+      # run and emit its output — the coverage percentage is printed here
+      # regardless of the run steps' exit codes, and the step itself exits 0,
+      # so a below-baseline number is visible in CI but never blocks the PR.
+      - name: coverage threshold (report-only — never fails)
+        shell: bash {0}
+        run: |
+          set +e
+          rs_log="server/target/llvm-cov/coverage.txt"
+          ts_log="console/coverage/coverage.txt"
+          extract_pct() {
+            # Matches the summarize.py "Overall line coverage:  NN.N%" line.
+            grep -m1 -oE 'Overall line coverage: +[0-9]+\.[0-9]+%' "$1" 2>/dev/null \
+              | grep -oE '[0-9]+\.[0-9]+%'
+          }
+          rs_pct="$(extract_pct "$rs_log" || echo n/a)"
+          ts_pct="$(extract_pct "$ts_log" || echo n/a)"
+          echo "::notice title=Coverage::rust=${rs_pct}%  ts=${ts_pct}%  (baseline=90%; CI is report-only, never fails)"
+          echo "rust coverage: ${rs_pct}%"
+          echo "ts   coverage: ${ts_pct}%"
+          echo "(CI coverage is report-only — a value ≤ 90% does not fail this job.)"
+          exit 0
+
+      # Publish the reports + raw JSON as short-lived artifacts so reviewers
+      # can read the per-crate/per-dir breakdown and gap lists without rerunning.
+      - name: upload coverage reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-reports
+          path: |
+            server/target/llvm-cov/coverage.json
+            server/target/llvm-cov/coverage.txt
+            console/coverage/*.json
+            console/coverage/coverage.txt
+          retention-days: 7
+          if-no-files-found: ignore

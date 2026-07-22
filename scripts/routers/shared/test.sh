@@ -18,6 +18,12 @@ show_help() {
     echo "   just test rs [filter]     cargo test (optional filter)"
     echo "   just test ts              bun test in console/"
     echo "   just test crate <name>    Test a single workspace crate"
+    echo ""
+    echo "📊 Coverage (cargo-llvm-cov + bun test --coverage)"
+    echo "   just test coverage         Both stacks, report-only (no gate)"
+    echo "   just test coverage rs       Rust only (merged report incl. fault-injection)"
+    echo "   just test coverage ts       Console only (denominator over src/**)"
+    echo "   just test coverage gate     Hard-fail if either < HERON_COV_MIN (default 90)"
 }
 
 run_rs() {
@@ -38,6 +44,37 @@ run_crate() {
     (cd server && cargo test -p "$name" "$@")
 }
 
+# Coverage (cargo-llvm-cov for Rust, bun test --coverage for TS).
+# `just test coverage [rs|ts|gate]` — the gate hard-fails locally below
+# HERON_COV_MIN (default 90); plain `coverage`/`rs`/`ts` are report-only.
+run_coverage() {
+    local sub="${1:-all}"
+    case "$sub" in
+        all|"")
+            # Both stacks, report-only (no gate). The gate script is only used
+            # for the explicit `gate` sub-command so it can hard-fail.
+            bash scripts/coverage/run_coverage_rs.sh
+            bash scripts/coverage/run_coverage_ts.sh
+            ;;
+        rs|rust)
+            shift 2>/dev/null || true
+            bash scripts/coverage/run_coverage_rs.sh "$@"
+            ;;
+        ts|typescript)
+            shift 2>/dev/null || true
+            bash scripts/coverage/run_coverage_ts.sh "$@"
+            ;;
+        gate)
+            bash scripts/coverage/coverage-gate.sh
+            ;;
+        *)
+            echo "Unknown coverage sub-command: $sub" >&2
+            echo "Run 'just test coverage' for help." >&2
+            exit 1
+            ;;
+    esac
+}
+
 ACTION="${1:-help}"
 shift 2>/dev/null || true
 
@@ -46,6 +83,7 @@ case "$ACTION" in
     rs|rust|server) run_rs "$@" ;;
     ts|typescript|console) run_ts "$@" ;;
     crate|pkg|p) run_crate "$@" ;;
+    coverage|cov) run_coverage "$@" ;;
     help|--help|-h) show_help ;;
     *) echo "Unknown: $ACTION. Run 'just test' for help."; exit 1 ;;
 esac
