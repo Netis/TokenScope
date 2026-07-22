@@ -103,6 +103,22 @@ const SUM_FIELDS: &[&str] = &[
 
 const MAX_FIELDS: &[&str] = &["active_calls_max"];
 
+/// Valid `sort_by` fields for `query_metrics_models`. Hoisted to module scope so
+/// the reject-unknown-sort path is unit-testable without a live client (the
+/// value is interpolated into `ORDER BY`, so an unknown field is rejected up
+/// front rather than reaching the engine). Mirrors the DuckDB whitelist.
+const MODELS_VALID_SORT_FIELDS: &[&str] = &[
+    "call_count",
+    "error_count",
+    "total_input_tokens",
+    "total_output_tokens",
+    "ttft_avg",
+    "ttft_p95",
+    "e2e_avg",
+    "e2e_p95",
+    "tpot_avg",
+];
+
 fn avg_pair(f: &str) -> Option<(&'static str, &'static str)> {
     match f {
         "active_calls_avg" => Some(("active_calls_sum", "active_calls_sample_count")),
@@ -363,18 +379,7 @@ impl ClickHouseBackend {
         &self,
         query: &MetricsModelsQuery,
     ) -> Result<Vec<MetricsModelRow>> {
-        const VALID_SORT_FIELDS: &[&str] = &[
-            "call_count",
-            "error_count",
-            "total_input_tokens",
-            "total_output_tokens",
-            "ttft_avg",
-            "ttft_p95",
-            "e2e_avg",
-            "e2e_p95",
-            "tpot_avg",
-        ];
-        if !VALID_SORT_FIELDS.contains(&query.sort_by.as_str()) {
+        if !MODELS_VALID_SORT_FIELDS.contains(&query.sort_by.as_str()) {
             return Err(AppError::Storage(format!(
                 "invalid sort_by field: {}",
                 query.sort_by
@@ -582,5 +587,191 @@ impl ClickHouseBackend {
                 turn_count: r.turn_count,
             })
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn avg_pair_maps_known_avg_fields() {
+        assert_eq!(
+            avg_pair("ttft_avg"),
+            Some(("ttft_sum", "ttft_count"))
+        );
+        assert_eq!(
+            avg_pair("e2e_avg"),
+            Some(("e2e_sum", "e2e_count"))
+        );
+        assert_eq!(
+            avg_pair("tpot_avg"),
+            Some(("tpot_sum", "tpot_count"))
+        );
+        assert_eq!(
+            avg_pair("active_calls_avg"),
+            Some(("active_calls_sum", "active_calls_sample_count"))
+        );
+        assert_eq!(avg_pair("input_tokens_avg"), Some(("total_input_tokens", "input_token_count")));
+        assert_eq!(avg_pair("output_tokens_avg"), Some(("total_output_tokens", "output_token_count")));
+        assert_eq!(avg_pair("ttft_stream_avg"), Some(("ttft_stream_sum", "ttft_stream_count")));
+        assert_eq!(
+            avg_pair("ttft_nonstream_avg"),
+            Some(("ttft_nonstream_sum", "ttft_nonstream_count"))
+        );
+    }
+
+    #[test]
+    fn avg_pair_unknown_is_none() {
+        assert_eq!(avg_pair("call_count"), None);
+        assert_eq!(avg_pair("ttft_p95"), None);
+        assert_eq!(avg_pair("not_a_field"), None);
+    }
+
+    #[test]
+    fn percentile_weight_routes_by_prefix() {
+        assert_eq!(percentile_weight("ttft_stream_p95"), "ttft_stream_count");
+        assert_eq!(percentile_weight("ttft_nonstream_p99"), "ttft_nonstream_count");
+        assert_eq!(percentile_weight("ttft_p50"), "ttft_count");
+        assert_eq!(percentile_weight("e2e_p95"), "e2e_count");
+        assert_eq!(percentile_weight("tpot_p95"), "tpot_count");
+        // Non-latency field falls through to call_count.
+        assert_eq!(percentile_weight("call_count"), "call_count");
+        assert_eq!(percentile_weight("anything"), "call_count");
+    }
+
+    #[test]
+    fn ch_field_expr_sum_for_count_total() {
+        let e = ch_field_expr("call_count");
+        assert_eq!(e, "CAST(sum(call_count) AS Nullable(Float64))");
+        // A SUM_FIELD that is not an avg/percentile/peak goes through the sum arm.
+        let e = ch_field_expr("total_input_tokens");
+        assert_eq!(e, "CAST(sum(total_input_tokens) AS Nullable(Float64))");
+    }
+
+    #[test]
+    fn ch_field_expr_max_for_peak() {
+        let e = ch_field_expr("active_calls_max");
+        assert_eq!(e, "CAST(max(active_calls_max) AS Nullable(Float64))");
+    }
+
+    #[test]
+    fn ch_field_expr_avg_is_count_guarded_ratio() {
+        let e = ch_field_expr("ttft_avg");
+        assert_eq!(
+            e,
+            "CAST(if(sum(ttft_count) > 0, sum(ttft_sum) / sum(ttft_count), NULL) AS Nullable(Float64))"
+        );
+        // Zero-denominator guard avoids divide-by-zero; the outer CAST keeps the
+        // array element type uniform.
+        assert!(e.contains("if(sum(ttft_count) > 0"));
+    }
+
+    #[test]
+    fn ch_field_expr_percentile_is_count_weighted_average() {
+        let e = ch_field_expr("ttft_p95");
+        assert_eq!(
+            e,
+            "CAST(if(sum(ttft_count) > 0, sum(ttft_p95 * ttft_count) / sum(ttft_count), NULL) \
+             AS Nullable(Float64))"
+        );
+        // The stream/non-stream variants route to their own count columns.
+        let es = ch_field_expr("ttft_stream_p99");
+        assert!(es.contains("sum(ttft_stream_count)"));
+        let en = ch_field_expr("ttft_nonstream_p50");
+        assert!(en.contains("sum(ttft_nonstream_count)"));
+    }
+
+    #[test]
+    fn ch_field_expr_unknown_falls_back_to_sum() {
+        // Anything unrecognized reaches the final `sum({f})` fallback arm.
+        let e = ch_field_expr("not_a_field");
+        assert_eq!(e, "CAST(sum(not_a_field) AS Nullable(Float64))");
+    }
+
+    #[test]
+    fn build_vals_array_empty() {
+        assert_eq!(
+            build_vals_array(&[]),
+            "CAST([] AS Array(Nullable(Float64))) AS vals"
+        );
+    }
+
+    #[test]
+    fn build_vals_array_projects_each_field() {
+        let vals = build_vals_array(&["call_count".into(), "ttft_avg".into()]);
+        assert!(vals.starts_with("["));
+        assert!(vals.ends_with(" AS vals"));
+        assert!(vals.contains("CAST(sum(call_count) AS Nullable(Float64))"));
+        assert!(vals.contains("if(sum(ttft_count) > 0, sum(ttft_sum) / sum(ttft_count), NULL)"));
+        // Fields are comma-joined inside the array projection.
+        assert!(vals.contains(", "));
+    }
+
+    #[test]
+    fn ts_where_targets_timestamp_column() {
+        assert_eq!(
+            ts_where(10, 20),
+            "timestamp >= fromUnixTimestamp64Micro(10) \
+             AND timestamp < fromUnixTimestamp64Micro(20)"
+        );
+    }
+
+    #[test]
+    fn valid_metric_fields_contains_known_set() {
+        // Guards the reject-unknown-field path by construction: these must be
+        // present so the API field names the frontend sends are accepted.
+        for &known in &[
+            "call_count",
+            "ttft_avg",
+            "ttft_p95",
+            "ttft_p99",
+            "ttft_stream_p95",
+            "ttft_nonstream_p99",
+            "e2e_avg",
+            "tpot_p50",
+            "error_429_count",
+            "active_calls_avg",
+        ] {
+            assert!(
+                VALID_METRIC_FIELDS.contains(&known),
+                "VALID_METRIC_FIELDS missing {known}"
+            );
+        }
+        assert!(!VALID_METRIC_FIELDS.contains(&"bogus_field"));
+    }
+
+    #[test]
+    fn models_sort_whitelist_contains_expected() {
+        for &known in &[
+            "call_count",
+            "error_count",
+            "total_input_tokens",
+            "total_output_tokens",
+            "ttft_avg",
+            "ttft_p95",
+            "e2e_avg",
+            "e2e_p95",
+            "tpot_avg",
+        ] {
+            assert!(
+                MODELS_VALID_SORT_FIELDS.contains(&known),
+                "models MODELS_VALID_SORT_FIELDS missing {known}"
+            );
+        }
+        assert!(!MODELS_VALID_SORT_FIELDS.contains(&"bogus"));
+    }
+
+    #[test]
+    fn sum_fields_and_max_fields_disjoint_from_avg() {
+        // Every SUM_FIELD must NOT be an avg field (avg_pair None) and not a
+        // percentile, so the dispatch order in ch_field_expr is unambiguous.
+        for &f in SUM_FIELDS {
+            assert_eq!(avg_pair(f), None, "{f} unexpectedly mapped to an avg pair");
+            assert!(!f.ends_with("_p50") && !f.ends_with("_p95") && !f.ends_with("_p99"));
+        }
+        for &f in MAX_FIELDS {
+            assert_eq!(avg_pair(f), None);
+        }
     }
 }

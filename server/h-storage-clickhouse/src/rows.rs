@@ -391,3 +391,437 @@ impl From<HttpExchange> for ExchangeRow {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use h_common::agent::{AgentTopology, ToolSurface};
+    use h_common::process::ProcessInfo;
+    use h_llm::model::ApiType;
+    use h_llm::wire_apis as wa;
+    use h_metrics::model::{LlmFinishMetric, LlmMetric};
+    use h_protocol::HttpExchange;
+    use h_turn::{Trace, TraceStatus};
+    use std::net::IpAddr;
+
+    /// Minimal `LlmCall` with non-default scalar fields set so every `CallRow`
+    /// mapping branch is exercised. Mirrors the shape used by the live IT
+    /// fixtures but kept local to this module.
+    fn sample_call(id: &str) -> LlmCall {
+        LlmCall {
+            source_id: "src-0".into(),
+            id: id.into(),
+            wire_api: wa::OPENAI_CHAT,
+            model: "gpt-4".into(),
+            api_type: ApiType::Chat,
+            request_time: 1_700_000_000_000_000,
+            response_time: Some(1_700_000_000_500_000),
+            complete_time: Some(1_700_000_001_000_000),
+            request_path: "/v1/chat/completions".into(),
+            is_stream: true,
+            request_body: Some(r#"{"model":"gpt-4"}"#.into()),
+            status_code: Some(200),
+            finish_reason: Some("stop".into()),
+            response_body: Some(r#"{"choices":[]}"#.into()),
+            input_tokens: Some(100),
+            output_tokens: Some(50),
+            total_tokens: Some(150),
+            cache_read_input_tokens: Some(10),
+            cache_creation_input_tokens: Some(20),
+            ttft_ms: Some(500.0),
+            e2e_latency_ms: Some(1000.0),
+            client_ip: "10.0.0.1".parse::<IpAddr>().unwrap(),
+            client_port: 54321,
+            server_ip: "10.0.0.2".parse::<IpAddr>().unwrap(),
+            server_port: 8080,
+            response_id: Some("chatcmpl-x".into()),
+            request_headers: vec![("content-type".into(), "application/json".into())],
+            response_headers: vec![("x-request-id".into(), "abc".into())],
+            is_agent_request: true,
+            tool_surface: Some(ToolSurface::Mcp),
+            agent_topology: Some(AgentTopology::Orchestrator),
+            tool_call_count: 3,
+            tool_names: vec!["bash".into(), "grep".into()],
+            body_bytes_dropped: 0,
+            process: Some(ProcessInfo::new(42, "node")),
+        }
+    }
+
+    #[test]
+    fn call_row_from_llm_call_maps_scalars_and_stringified_ips() {
+        let row = CallRow::from(sample_call("call-1"));
+        assert_eq!(row.id, "call-1");
+        assert_eq!(row.source_id, "src-0");
+        assert_eq!(row.client_ip, "10.0.0.1");
+        assert_eq!(row.client_port, 54321);
+        assert_eq!(row.server_ip, "10.0.0.2");
+        assert_eq!(row.server_port, 8080);
+        assert_eq!(row.request_time, 1_700_000_000_000_000);
+        assert_eq!(row.response_time, Some(1_700_000_000_500_000));
+        assert_eq!(row.complete_time, Some(1_700_000_001_000_000));
+        assert_eq!(row.wire_api, "openai-chat");
+        assert_eq!(row.model, "gpt-4");
+        assert_eq!(row.api_type, "chat");
+        assert!(row.is_stream);
+        assert_eq!(row.request_path, "/v1/chat/completions");
+        assert_eq!(row.status_code, Some(200));
+        assert_eq!(row.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(row.input_tokens, Some(100));
+        assert_eq!(row.output_tokens, Some(50));
+        assert_eq!(row.total_tokens, Some(150));
+        assert_eq!(row.cache_read_input_tokens, Some(10));
+        assert_eq!(row.cache_creation_input_tokens, Some(20));
+        assert_eq!(row.ttft_ms, Some(500.0));
+        assert_eq!(row.e2e_latency_ms, Some(1000.0));
+        assert_eq!(row.request_body.as_deref(), Some(r#"{"model":"gpt-4"}"#));
+        assert_eq!(row.response_body.as_deref(), Some(r#"{"choices":[]}"#));
+        assert_eq!(row.response_id.as_deref(), Some("chatcmpl-x"));
+        assert!(row.is_agent_request);
+        assert_eq!(row.tool_call_count, 3);
+        assert_eq!(row.body_bytes_dropped, 0);
+        assert_eq!(row.process_pid, Some(42));
+        assert_eq!(row.process_comm.as_deref(), Some("node"));
+        assert_eq!(row.process_exe, None); // ProcessInfo::new leaves exe None
+        assert_eq!(row.kind, "llm");
+    }
+
+    #[test]
+    fn call_row_headers_are_json_pair_arrays() {
+        let row = CallRow::from(sample_call("c"));
+        let req: serde_json::Value = serde_json::from_str(&row.request_headers).unwrap();
+        assert!(req.is_array());
+        assert_eq!(req[0][0], "content-type");
+        assert_eq!(req[0][1], "application/json");
+        let resp: serde_json::Value = serde_json::from_str(&row.response_headers).unwrap();
+        assert_eq!(resp[0][0], "x-request-id");
+        assert_eq!(resp[0][1], "abc");
+    }
+
+    #[test]
+    fn call_row_tool_names_and_surface_and_topology_serialized() {
+        let row = CallRow::from(sample_call("c"));
+        let names: Vec<String> = serde_json::from_str(row.tool_names_json.as_deref().unwrap()).unwrap();
+        assert_eq!(names, vec!["bash".to_string(), "grep".to_string()]);
+        assert_eq!(row.tool_surface.as_deref(), Some("mcp"));
+        assert_eq!(row.agent_topology.as_deref(), Some("orchestrator"));
+    }
+
+    #[test]
+    fn call_row_from_empty_tool_names_yields_json_array() {
+        let mut c = sample_call("c");
+        c.tool_names = vec![];
+        let row = CallRow::from(c);
+        assert_eq!(row.tool_names_json.as_deref(), Some("[]"));
+    }
+
+    #[test]
+    fn call_row_passive_tap_has_no_process() {
+        let mut c = sample_call("c");
+        c.process = None;
+        let row = CallRow::from(c);
+        assert_eq!(row.process_pid, None);
+        assert_eq!(row.process_comm, None);
+        assert_eq!(row.process_exe, None);
+    }
+
+    fn sample_metric() -> LlmMetric {
+        LlmMetric {
+            timestamp_us: 1_700_000_000_000_000,
+            source_id: "src-0".into(),
+            granularity: "1m",
+            wire_api: "openai-chat".into(),
+            model: "gpt-4".into(),
+            server_ip: "10.0.0.2".into(),
+            call_count: 5,
+            stream_count: 3,
+            non_stream_count: 2,
+            active_calls_sum: 7,
+            active_calls_sample_count: 4,
+            active_calls_max: 9,
+            total_input_tokens: 100,
+            input_token_count: 5,
+            total_output_tokens: 50,
+            output_token_count: 5,
+            total_cache_read_input_tokens: 10,
+            total_cache_creation_input_tokens: 20,
+            error_count: 1,
+            error_4xx_count: 1,
+            error_429_count: 1,
+            error_5xx_count: 0,
+            ttft_sum: 2500.0,
+            ttft_count: 5,
+            ttft_p50: Some(400.0),
+            ttft_p95: Some(600.0),
+            ttft_p99: Some(900.0),
+            ttft_stream_sum: 2000.0,
+            ttft_stream_count: 4,
+            ttft_stream_p50: Some(400.0),
+            ttft_stream_p95: Some(500.0),
+            ttft_stream_p99: Some(550.0),
+            ttft_nonstream_sum: 500.0,
+            ttft_nonstream_count: 1,
+            ttft_nonstream_p50: Some(500.0),
+            ttft_nonstream_p95: None,
+            ttft_nonstream_p99: None,
+            e2e_sum: 5000.0,
+            e2e_count: 5,
+            e2e_p50: Some(800.0),
+            e2e_p95: Some(1200.0),
+            e2e_p99: Some(2000.0),
+            tpot_sum: 50.0,
+            tpot_count: 5,
+            tpot_p50: Some(10.0),
+            tpot_p95: Some(12.0),
+            tpot_p99: Some(15.0),
+            tool_surface: Some("cli".into()),
+        }
+    }
+
+    #[test]
+    fn metric_row_from_llm_metric_is_field_for_field() {
+        let row = MetricRow::from(sample_metric());
+        assert_eq!(row.timestamp, 1_700_000_000_000_000);
+        assert_eq!(row.source_id, "src-0");
+        assert_eq!(row.granularity, "1m");
+        assert_eq!(row.wire_api, "openai-chat");
+        assert_eq!(row.model, "gpt-4");
+        assert_eq!(row.server_ip, "10.0.0.2");
+        assert_eq!(row.call_count, 5);
+        assert_eq!(row.stream_count, 3);
+        assert_eq!(row.non_stream_count, 2);
+        assert_eq!(row.active_calls_sum, 7);
+        assert_eq!(row.active_calls_sample_count, 4);
+        assert_eq!(row.active_calls_max, 9);
+        assert_eq!(row.total_input_tokens, 100);
+        assert_eq!(row.input_token_count, 5);
+        assert_eq!(row.total_output_tokens, 50);
+        assert_eq!(row.output_token_count, 5);
+        assert_eq!(row.total_cache_read_input_tokens, 10);
+        assert_eq!(row.total_cache_creation_input_tokens, 20);
+        assert_eq!(row.error_count, 1);
+        assert_eq!(row.error_4xx_count, 1);
+        assert_eq!(row.error_429_count, 1);
+        assert_eq!(row.error_5xx_count, 0);
+        assert_eq!(row.ttft_sum, 2500.0);
+        assert_eq!(row.ttft_count, 5);
+        assert_eq!(row.ttft_p50, Some(400.0));
+        assert_eq!(row.ttft_p95, Some(600.0));
+        assert_eq!(row.ttft_p99, Some(900.0));
+        assert_eq!(row.ttft_stream_sum, 2000.0);
+        assert_eq!(row.ttft_stream_count, 4);
+        assert_eq!(row.e2e_sum, 5000.0);
+        assert_eq!(row.e2e_count, 5);
+        assert_eq!(row.e2e_p99, Some(2000.0));
+        assert_eq!(row.tpot_sum, 50.0);
+        assert_eq!(row.tpot_count, 5);
+        assert_eq!(row.tpot_p95, Some(12.0));
+        // None percentiles must pass through as None (nullable columns).
+        assert_eq!(row.ttft_nonstream_p95, None);
+        assert_eq!(row.ttft_nonstream_p99, None);
+        assert_eq!(row.tool_surface.as_deref(), Some("cli"));
+    }
+
+    #[test]
+    fn finish_metric_row_from_llm_finish_metric() {
+        let m = LlmFinishMetric {
+            timestamp_us: 1_700_000_000_000_000,
+            source_id: "src-0".into(),
+            granularity: "1m".into(),
+            wire_api: "openai-chat".into(),
+            model: "gpt-4".into(),
+            server_ip: "10.0.0.2".into(),
+            finish_reason: "stop".into(),
+            count: 7,
+        };
+        let row = FinishMetricRow::from(m);
+        assert_eq!(row.timestamp, 1_700_000_000_000_000);
+        assert_eq!(row.source_id, "src-0");
+        assert_eq!(row.granularity, "1m");
+        assert_eq!(row.wire_api, "openai-chat");
+        assert_eq!(row.model, "gpt-4");
+        assert_eq!(row.server_ip, "10.0.0.2");
+        assert_eq!(row.finish_reason, "stop");
+        assert_eq!(row.count, 7);
+    }
+
+    fn sample_turn(end_time_us: i64) -> Trace {
+        Trace {
+            source_id: "src-0".into(),
+            turn_id: "turn-1".into(),
+            session_id: "sess-1".into(),
+            wire_api: "openai-chat".into(),
+            agent_kind: "claude-cli".into(),
+            client_ip: "10.0.0.1".parse().unwrap(),
+            server_ip: "10.0.0.2".parse().unwrap(),
+            start_time_us: end_time_us - 5_000_000,
+            end_time_us,
+            duration_ms: 5_000,
+            call_count: 2,
+            models_used: vec!["gpt-4".into()],
+            subagents_used: vec!["task".into()],
+            total_input_tokens: 100,
+            total_output_tokens: 50,
+            total_cache_read_input_tokens: 10,
+            total_cache_creation_input_tokens: 20,
+            total_cost_usd: Some(0.0123),
+            status: TraceStatus::Complete,
+            final_finish_reason: Some("stop".into()),
+            user_input_preview: Some("hello".into()),
+            user_call_id: Some("c1".into()),
+            final_answer_preview: Some("world".into()),
+            final_call_id: Some("c2".into()),
+            span_ids: vec!["c1".into(), "c2".into()],
+            metadata: serde_json::json!({"k": "v"}),
+            tool_surfaces: vec![ToolSurface::Mcp, ToolSurface::Cli],
+            tool_call_total: 4,
+            agent_topology: Some(AgentTopology::SubAgent),
+            suspicious_skills: vec![h_turn::SuspiciousSkillRollup {
+                tool_name: "bash".into(),
+                reason: "shell".into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn turn_row_from_trace_serializes_json_columns() {
+        let end = 1_700_000_001_000_000_i64;
+        let row = TurnRow::from(sample_turn(end));
+        assert_eq!(row.turn_id, "turn-1");
+        assert_eq!(row.source_id, "src-0");
+        assert_eq!(row.session_id, "sess-1");
+        assert_eq!(row.wire_api, "openai-chat");
+        assert_eq!(row.agent_kind, "claude-cli");
+        assert_eq!(row.client_ip, "10.0.0.1");
+        assert_eq!(row.server_ip, "10.0.0.2");
+        assert_eq!(row.start_time, end - 5_000_000);
+        assert_eq!(row.end_time, end);
+        assert_eq!(row.duration_ms, 5_000);
+        assert_eq!(row.call_count, 2);
+        assert_eq!(row.total_input_tokens, 100);
+        assert_eq!(row.total_output_tokens, 50);
+        assert_eq!(row.total_cache_read_input_tokens, 10);
+        assert_eq!(row.total_cache_creation_input_tokens, 20);
+        assert_eq!(row.total_cost_usd, Some(0.0123));
+        assert_eq!(row.status, "complete");
+        assert_eq!(row.final_finish_reason.as_deref(), Some("stop"));
+        assert_eq!(row.user_input_preview.as_deref(), Some("hello"));
+        assert_eq!(row.user_call_id.as_deref(), Some("c1"));
+        assert_eq!(row.final_answer_preview.as_deref(), Some("world"));
+        assert_eq!(row.final_call_id.as_deref(), Some("c2"));
+        assert_eq!(row.tool_call_total, 4);
+        assert_eq!(row.agent_topology.as_deref(), Some("sub_agent"));
+
+        // JSON-encoded columns are real arrays / objects, not raw strings.
+        let span_ids: Vec<String> = serde_json::from_str(&row.span_ids).unwrap();
+        assert_eq!(span_ids, vec!["c1".to_string(), "c2".to_string()]);
+        let models: Vec<String> = serde_json::from_str(row.models_used.as_deref().unwrap()).unwrap();
+        assert_eq!(models, vec!["gpt-4".to_string()]);
+        let subs: Vec<String> =
+            serde_json::from_str(row.subagents_used.as_deref().unwrap()).unwrap();
+        assert_eq!(subs, vec!["task".to_string()]);
+        let md: serde_json::Value = serde_json::from_str(row.metadata.as_deref().unwrap()).unwrap();
+        assert_eq!(md["k"], "v");
+        let surfaces: Vec<String> =
+            serde_json::from_str(row.tool_surfaces_json.as_deref().unwrap()).unwrap();
+        assert_eq!(surfaces, vec!["mcp".to_string(), "cli".to_string()]);
+        let susp: Vec<serde_json::Value> =
+            serde_json::from_str(row.suspicious_skills_json.as_deref().unwrap()).unwrap();
+        assert_eq!(susp[0]["tool_name"], "bash");
+        assert_eq!(susp[0]["reason"], "shell");
+    }
+
+    #[test]
+    fn turn_row_version_is_end_time_micros() {
+        // Initial finalize version = end_time (micros); update_trace_metadata
+        // re-inserts with a strictly-greater wall-clock-micros version.
+        let end = 1_700_000_001_000_000_i64;
+        let row = TurnRow::from(sample_turn(end));
+        assert_eq!(row._version, end.max(0) as u64);
+    }
+
+    #[test]
+    fn turn_row_version_clamps_negative_end_time() {
+        let row = TurnRow::from(sample_turn(-5));
+        assert_eq!(row._version, 0);
+    }
+
+    #[test]
+    fn exchange_row_from_http_exchange_maps_addrs_and_bodies() {
+        let x = sample_exchange("xchg-1", 1_700_000_000_000_000);
+        let row = ExchangeRow::from(x);
+        assert_eq!(row.id, "xchg-1");
+        assert_eq!(row.source_id, "src-0");
+        assert_eq!(row.client_ip, "10.0.0.1");
+        assert_eq!(row.client_port, 54321);
+        assert_eq!(row.server_ip, "10.0.0.2");
+        assert_eq!(row.server_port, 443);
+        assert_eq!(row.method, "POST");
+        assert_eq!(row.uri, "/v1/chat/completions");
+        assert_eq!(row.request_body.as_deref(), Some(r#"{"model":"gpt-4"}"#));
+        assert_eq!(row.status, Some(200));
+        assert_eq!(row.response_body.as_deref(), Some(r#"{"choices":[]}"#));
+        assert!(!row.is_sse);
+        assert_eq!(row.sse_event_count, 0);
+        assert_eq!(row.sse_data_bytes, 0);
+        assert_eq!(row.request_time, 1_700_000_000_000_000);
+        assert_eq!(row.response_first_byte_time, Some(1_700_000_000_500_000));
+        assert_eq!(row.response_complete_time, Some(1_700_000_001_000_000));
+        // Headers serialized as JSON pair arrays.
+        let req: serde_json::Value = serde_json::from_str(&row.request_headers).unwrap();
+        assert_eq!(req[0][0], "content-type");
+    }
+
+    #[test]
+    fn exchange_row_empty_request_body_becomes_none() {
+        let mut x = sample_exchange("x", 0);
+        // Replace the request with one whose body is empty.
+        let mut req = (*x.request).clone();
+        req.body = bytes::Bytes::new();
+        x.request = std::sync::Arc::new(req);
+        let row = ExchangeRow::from(x);
+        assert_eq!(row.request_body, None);
+    }
+
+    /// Minimal paired HTTP exchange (generic IPs, placeholder ids) for the
+    /// `ExchangeRow::from` mapping — kept local so the test module is
+    /// self-contained. Mirrors the shape of the live-IT fixture.
+    fn sample_exchange(id: &str, request_time_us: i64) -> HttpExchange {
+        use bytes::Bytes;
+        use h_protocol::model::{HttpRequestData, HttpResponseData};
+        use h_protocol::net::FlowKey;
+        use std::sync::Arc;
+        let client_ip: IpAddr = "10.0.0.1".parse().unwrap();
+        let server_ip: IpAddr = "10.0.0.2".parse().unwrap();
+        let request = Arc::new(HttpRequestData {
+            flow_key: FlowKey::new("src-0".into(), client_ip, 54321, server_ip, 443),
+            client_addr: (client_ip, 54321),
+            server_addr: (server_ip, 443),
+            method: "POST".into(),
+            uri: "/v1/chat/completions".into(),
+            version: 1,
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: Bytes::from_static(br#"{"model":"gpt-4"}"#),
+            timestamp_us: request_time_us,
+            process: None,
+        });
+        let response = Arc::new(HttpResponseData {
+            flow_key: request.flow_key.clone(),
+            client_addr: request.client_addr,
+            server_addr: request.server_addr,
+            status: 200,
+            version: 1,
+            headers: vec![("x-request-id".into(), "req_abc".into())],
+            body: Bytes::from_static(br#"{"choices":[]}"#),
+            first_byte_timestamp_us: request_time_us + 500_000,
+            complete_timestamp_us: request_time_us + 1_000_000,
+            process: None,
+        });
+        HttpExchange {
+            id: id.to_string(),
+            request,
+            response,
+            sse_event_count: 0,
+            sse_data_bytes: 0,
+        }
+    }
+}

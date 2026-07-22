@@ -136,53 +136,9 @@ impl ClickHouseBackend {
                 query.sort_by
             )));
         }
-        let sort_order = if query.sort_order.eq_ignore_ascii_case("ASC") {
-            "ASC"
-        } else {
-            "DESC"
-        };
+        let sort_order = resolve_sort_order(&query.sort_order);
 
-        // Time-range + filter WHERE. Timestamps and numeric ports are
-        // interpolated (values we control); user string lists go through
-        // `sql_in_list`'s single-quote escaping, valid in ClickHouse.
-        let mut where_parts =
-            vec![time_where("request_time", query.time_range.start_us, query.time_range.end_us)];
-        if !query.filter.wire_apis.is_empty() {
-            where_parts.push(format!("wire_api IN ({})", sql_in_list(&query.filter.wire_apis)));
-        }
-        if !query.filter.models.is_empty() {
-            where_parts.push(format!("model IN ({})", sql_in_list(&query.filter.models)));
-        }
-        if !query.filter.server_ips.is_empty() {
-            where_parts.push(format!("server_ip IN ({})", sql_in_list(&query.filter.server_ips)));
-        }
-        if !query.status_codes.is_empty() {
-            where_parts.push(format!("status_code IN ({})", join_nums(&query.status_codes)));
-        }
-        if !query.finish_reasons.is_empty() {
-            where_parts.push(format!(
-                "finish_reason IN ({})",
-                sql_in_list(&query.finish_reasons)
-            ));
-        }
-        if !query.client_ips.is_empty() {
-            where_parts.push(format!("client_ip IN ({})", sql_in_list(&query.client_ips)));
-        }
-        if !query.server_ports.is_empty() {
-            where_parts.push(format!("server_port IN ({})", join_nums(&query.server_ports)));
-        }
-        if let Some(substr) = query
-            .request_path_contains
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            where_parts.push(format!("request_path LIKE '%{}%'", escape_str(substr)));
-        }
-        if let Some(stream) = query.is_stream {
-            where_parts.push(format!("is_stream = {}", if stream { 1 } else { 0 }));
-        }
-        let where_sql = where_parts.join(" AND ");
+        let where_sql = spans_where_sql(query);
 
         let total = self
             .client
@@ -376,6 +332,63 @@ fn join_nums<T: std::fmt::Display>(values: &[T]) -> String {
         .join(", ")
 }
 
+/// Normalize a client-supplied sort direction to the SQL literal. Anything
+/// other than an ASCII-case-insensitive `ASC` (including the empty / missing
+/// value the API defaults to `"desc"` for) collapses to `DESC`, so a malformed
+/// `sort_order` can never inject a non-keyword into the ORDER BY clause.
+pub(crate) fn resolve_sort_order(sort_order: &str) -> &'static str {
+    if sort_order.eq_ignore_ascii_case("ASC") {
+        "ASC"
+    } else {
+        "DESC"
+    }
+}
+
+/// Build the `query_spans` WHERE clause: a half-open `request_time` time range
+/// AND-ed with every present dimension filter. Extracted as a pure fn so the
+/// escaping / IN-list / LIKE assembly is unit-testable without a live server.
+/// Timestamps and numeric ports are interpolated (values we control); user
+/// string lists go through `sql_in_list`'s backslash-aware single-quote
+/// escaping; the `LIKE` substring goes through `escape_str` (which deliberately
+/// leaves `%` / `_` so substring semantics survive).
+pub(crate) fn spans_where_sql(query: &SpansQuery) -> String {
+    let mut where_parts =
+        vec![time_where("request_time", query.time_range.start_us, query.time_range.end_us)];
+    if !query.filter.wire_apis.is_empty() {
+        where_parts.push(format!("wire_api IN ({})", sql_in_list(&query.filter.wire_apis)));
+    }
+    if !query.filter.models.is_empty() {
+        where_parts.push(format!("model IN ({})", sql_in_list(&query.filter.models)));
+    }
+    if !query.filter.server_ips.is_empty() {
+        where_parts.push(format!("server_ip IN ({})", sql_in_list(&query.filter.server_ips)));
+    }
+    if !query.status_codes.is_empty() {
+        where_parts.push(format!("status_code IN ({})", join_nums(&query.status_codes)));
+    }
+    if !query.finish_reasons.is_empty() {
+        where_parts.push(format!("finish_reason IN ({})", sql_in_list(&query.finish_reasons)));
+    }
+    if !query.client_ips.is_empty() {
+        where_parts.push(format!("client_ip IN ({})", sql_in_list(&query.client_ips)));
+    }
+    if !query.server_ports.is_empty() {
+        where_parts.push(format!("server_port IN ({})", join_nums(&query.server_ports)));
+    }
+    if let Some(substr) = query
+        .request_path_contains
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        where_parts.push(format!("request_path LIKE '%{}%'", escape_str(substr)));
+    }
+    if let Some(stream) = query.is_stream {
+        where_parts.push(format!("is_stream = {}", if stream { 1 } else { 0 }));
+    }
+    where_parts.join(" AND ")
+}
+
 /// Build `Option<ProcessInfo>` from the three nullable `process_*` columns.
 /// `None` exactly when `pid` is NULL (passive-tap rows).
 fn row_process(pid: Option<u32>, comm: Option<String>, exe: Option<String>) -> Option<ProcessInfo> {
@@ -457,5 +470,322 @@ fn call_detail(r: SpanDetailRow) -> SpanDetail {
         tool_call_count: r.tool_call_count,
         tool_names,
         process,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn list_row(response_body: Option<String>) -> CallListRow {
+        CallListRow {
+            id: "call-1".into(),
+            source_id: "src-0".into(),
+            request_time_ms: 1_700_000_000_000,
+            wire_api: "openai-chat".into(),
+            model: "gpt-4".into(),
+            status_code: Some(200),
+            is_stream: true,
+            finish_reason: Some("stop".into()),
+            ttft_ms: Some(500.0),
+            e2e_latency_ms: Some(1000.0),
+            input_tokens: Some(100),
+            output_tokens: Some(50),
+            client_ip: "10.0.0.1".into(),
+            server_ip: "10.0.0.2".into(),
+            server_port: 8080,
+            request_path: "/v1/chat/completions".into(),
+            response_body,
+            is_agent_request: false,
+            tool_surface: None,
+            agent_topology: None,
+            tool_call_count: 0,
+            tool_names_json: Some(r#"["bash","grep"]"#.into()),
+            process_pid: None,
+            process_comm: None,
+            process_exe: None,
+        }
+    }
+
+    #[test]
+    fn join_nums_renders_numeric_in_list() {
+        assert_eq!(join_nums(&[8080u16, 443u16]), "8080, 443");
+        assert_eq!(join_nums(&[200u16]), "200");
+        assert_eq!(join_nums::<u16>(&[]), "");
+    }
+
+    #[test]
+    fn row_process_none_when_pid_none() {
+        assert_eq!(row_process(None, Some("node".into()), Some("/x".into())), None);
+        // pid present → Some(ProcessInfo); comm defaults to "" when absent; exe pass-through.
+        let p = row_process(Some(7), None, None).unwrap();
+        assert_eq!(p.pid, 7);
+        assert_eq!(p.comm, "");
+        assert_eq!(p.exe, None);
+        let p = row_process(Some(7), Some("node".into()), Some("/usr/bin/node".into())).unwrap();
+        assert_eq!(p.comm, "node");
+        assert_eq!(p.exe.as_deref(), Some("/usr/bin/node"));
+    }
+
+    #[test]
+    fn call_list_item_maps_scalars_and_ms_timestamp() {
+        let item = call_list_item(list_row(None));
+        assert_eq!(item.id, "call-1");
+        assert_eq!(item.source_id, "src-0");
+        assert_eq!(item.request_time, 1_700_000_000_000);
+        assert_eq!(item.wire_api, "openai-chat");
+        assert_eq!(item.model, "gpt-4");
+        assert_eq!(item.status_code, Some(200));
+        assert!(item.is_stream);
+        assert_eq!(item.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(item.ttft_ms, Some(500.0));
+        assert_eq!(item.e2e_latency_ms, Some(1000.0));
+        assert_eq!(item.input_tokens, Some(100));
+        assert_eq!(item.output_tokens, Some(50));
+        assert_eq!(item.client_ip, "10.0.0.1");
+        assert_eq!(item.server_ip, "10.0.0.2");
+        assert_eq!(item.server_port, 8080);
+        assert_eq!(item.request_path, "/v1/chat/completions");
+        assert!(!item.is_agent_request);
+        assert_eq!(item.tool_names, vec!["bash".to_string(), "grep".to_string()]);
+        assert_eq!(item.process, None);
+    }
+
+    #[test]
+    fn call_list_item_tokens_estimated_follows_usage_block() {
+        // Body with a positive usage block → wire tokens → estimated = false.
+        let with_usage = list_row(Some(
+            r#"{"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":50}}"#.into(),
+        ));
+        assert!(!call_list_item(with_usage).tokens_estimated);
+
+        // Body without a usage block → estimated = true.
+        let no_usage = list_row(Some(r#"{"choices":[{"message":{"content":"hi"}}]}"#.into()));
+        assert!(call_list_item(no_usage).tokens_estimated);
+
+        // No body at all → estimated = true.
+        assert!(call_list_item(list_row(None)).tokens_estimated);
+    }
+
+    #[test]
+    fn call_list_item_zero_tokens_never_estimated() {
+        let mut r = list_row(None);
+        r.input_tokens = Some(0);
+        r.output_tokens = Some(0);
+        // Even with no body, zero tokens → not estimated.
+        assert!(!call_list_item(r).tokens_estimated);
+    }
+
+    #[test]
+    fn call_list_item_malformed_tool_names_json_degrades_to_empty() {
+        let mut r = list_row(None);
+        r.tool_names_json = Some("not-json".into());
+        assert_eq!(call_list_item(r).tool_names, Vec::<String>::new());
+    }
+
+    fn detail_row(response_body: Option<String>) -> SpanDetailRow {
+        SpanDetailRow {
+            id: "call-1".into(),
+            source_id: "src-0".into(),
+            request_time_ms: 1_700_000_000_000,
+            response_time_ms: Some(1_700_000_000_500),
+            complete_time_ms: Some(1_700_000_001_000),
+            wire_api: "openai-chat".into(),
+            model: "gpt-4".into(),
+            api_type: "chat".into(),
+            is_stream: true,
+            request_path: "/v1/chat/completions".into(),
+            status_code: Some(200),
+            finish_reason: Some("stop".into()),
+            input_tokens: Some(100),
+            output_tokens: Some(50),
+            total_tokens: Some(150),
+            ttft_ms: Some(500.0),
+            e2e_latency_ms: Some(1000.0),
+            response_id: Some("chatcmpl-x".into()),
+            client_ip: "10.0.0.1".into(),
+            client_port: 54321,
+            server_ip: "10.0.0.2".into(),
+            server_port: 8080,
+            request_body: Some(r#"{"model":"gpt-4"}"#.into()),
+            response_body,
+            request_headers: r#"[["content-type","application/json"]]"#.into(),
+            response_headers: r#"[["x-request-id","abc"]]"#.into(),
+            is_agent_request: false,
+            tool_surface: None,
+            agent_topology: None,
+            tool_call_count: 0,
+            tool_names_json: Some("[]".into()),
+            process_pid: Some(42),
+            process_comm: Some("node".into()),
+            process_exe: Some("/usr/bin/node".into()),
+        }
+    }
+
+    #[test]
+    fn call_detail_wraps_headers_in_some() {
+        // SpanDetailRow.request_headers / response_headers are non-null String;
+        // SpanDetail wraps them in Some(...) to match the API shape.
+        let d = call_detail(detail_row(None));
+        assert_eq!(d.id, "call-1");
+        assert_eq!(d.response_time, Some(1_700_000_000_500));
+        assert_eq!(d.complete_time, Some(1_700_000_001_000));
+        assert_eq!(d.api_type, "chat");
+        assert_eq!(d.total_tokens, Some(150));
+        assert_eq!(d.response_id.as_deref(), Some("chatcmpl-x"));
+        assert_eq!(d.client_port, 54321);
+        assert_eq!(d.request_headers.as_deref(), Some(r#"[["content-type","application/json"]]"#));
+        assert_eq!(d.response_headers.as_deref(), Some(r#"[["x-request-id","abc"]]"#));
+        assert_eq!(d.request_body.as_deref(), Some(r#"{"model":"gpt-4"}"#));
+        // process built from the three process_* columns.
+        assert_eq!(
+            d.process.as_ref().unwrap(),
+            &ProcessInfo {
+                pid: 42,
+                comm: "node".into(),
+                exe: Some("/usr/bin/node".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn call_detail_tokens_estimated_follows_usage_block() {
+        let with_usage = detail_row(Some(
+            r#"{"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":50}}"#.into(),
+        ));
+        assert!(!call_detail(with_usage).tokens_estimated);
+        let no_usage = detail_row(Some(r#"{"choices":[]}"#.into()));
+        assert!(call_detail(no_usage).tokens_estimated);
+    }
+
+    #[test]
+    fn valid_sort_fields_is_whitelisted() {
+        // The `query_spans` sort_by is interpolated into ORDER BY, so an unknown
+        // field must be rejected up front — the whitelist is the gate.
+        for &known in VALID_SORT_FIELDS {
+            // every entry is a plain column name (no injection surface).
+            assert!(known.chars().all(|c| c.is_alphanumeric() || c == '_'));
+        }
+        assert!(VALID_SORT_FIELDS.contains(&"request_time"));
+        assert!(VALID_SORT_FIELDS.contains(&"ttft_ms"));
+        assert!(!VALID_SORT_FIELDS.contains(&"bogus"));
+    }
+
+    fn spans_query() -> SpansQuery {
+        SpansQuery {
+            time_range: TimeRange { start_us: 100, end_us: 200 },
+            filter: DimensionFilter::default(),
+            status_codes: vec![],
+            finish_reasons: vec![],
+            client_ips: vec![],
+            server_ports: vec![],
+            request_path_contains: None,
+            is_stream: None,
+            sort_by: "request_time".into(),
+            sort_order: "desc".into(),
+            page: 1,
+            page_size: 10,
+        }
+    }
+
+    #[test]
+    fn resolve_sort_order_normalizes() {
+        assert_eq!(resolve_sort_order("asc"), "ASC");
+        assert_eq!(resolve_sort_order("ASC"), "ASC");
+        assert_eq!(resolve_sort_order("Asc"), "ASC");
+        assert_eq!(resolve_sort_order("desc"), "DESC");
+        assert_eq!(resolve_sort_order("DESC"), "DESC");
+        // Anything non-ASC (including garbage / empty) collapses to DESC so a
+        // malformed value can never inject a non-keyword into ORDER BY.
+        assert_eq!(resolve_sort_order(""), "DESC");
+        assert_eq!(resolve_sort_order("garbage; DROP"), "DESC");
+    }
+
+    #[test]
+    fn spans_where_sql_is_time_range_only_by_default() {
+        let s = spans_where_sql(&spans_query());
+        assert_eq!(
+            s,
+            "request_time >= fromUnixTimestamp64Micro(100) \
+             AND request_time < fromUnixTimestamp64Micro(200)"
+        );
+    }
+
+    #[test]
+    fn spans_where_sql_combines_all_filters() {
+        let q = SpansQuery {
+            filter: DimensionFilter {
+                wire_apis: vec!["openai-chat".into()],
+                models: vec!["gpt-4".into()],
+                server_ips: vec!["10.0.0.2".into()],
+                tool_surfaces: vec![],
+            },
+            status_codes: vec![429],
+            finish_reasons: vec!["stop".into()],
+            client_ips: vec!["10.0.0.1".into()],
+            server_ports: vec![8080],
+            request_path_contains: Some("chat/completions".into()),
+            is_stream: Some(true),
+            ..spans_query()
+        };
+        let s = spans_where_sql(&q);
+        // Every filter appends an AND'd predicate in declaration order.
+        assert!(s.contains("wire_api IN ('openai-chat')"));
+        assert!(s.contains("model IN ('gpt-4')"));
+        assert!(s.contains("server_ip IN ('10.0.0.2')"));
+        assert!(s.contains("status_code IN (429)"));
+        assert!(s.contains("finish_reason IN ('stop')"));
+        assert!(s.contains("client_ip IN ('10.0.0.1')"));
+        assert!(s.contains("server_port IN (8080)"));
+        assert!(s.contains("request_path LIKE '%chat/completions%'"));
+        assert!(s.contains("is_stream = 1"));
+        // Joined by AND, no trailing/leading separator.
+        assert!(!s.starts_with(" AND"));
+        assert!(!s.ends_with("AND "));
+    }
+
+    #[test]
+    fn spans_where_sql_like_escapes_quotes_not_wildcards() {
+        let q = SpansQuery {
+            request_path_contains: Some("a'b".into()),
+            ..spans_query()
+        };
+        let s = spans_where_sql(&q);
+        // The embedded quote is doubled (no breakout); the % wrappers come from
+        // the format string, not the value.
+        assert!(s.contains("request_path LIKE '%a''b%'"));
+    }
+
+    #[test]
+    fn spans_where_sql_trims_and_ignores_empty_like_substring() {
+        let q = SpansQuery {
+            request_path_contains: Some("   ".into()),
+            ..spans_query()
+        };
+        // A whitespace-only substring is trimmed to empty → no LIKE predicate.
+        assert!(!spans_where_sql(&q).contains("LIKE"));
+    }
+
+    #[test]
+    fn spans_where_sql_is_stream_false() {
+        let q = SpansQuery {
+            is_stream: Some(false),
+            ..spans_query()
+        };
+        assert!(spans_where_sql(&q).contains("is_stream = 0"));
+    }
+
+    #[test]
+    fn spans_where_sql_in_list_uses_backslash_escaping() {
+        let q = SpansQuery {
+            filter: DimensionFilter {
+                models: vec![r"gpt\4".into()],
+                ..Default::default()
+            },
+            ..spans_query()
+        };
+        // A backslash in a model value is doubled (ClickHouse-aware), keeping
+        // the literal closed.
+        assert!(spans_where_sql(&q).contains(r"model IN ('gpt\\4')"));
     }
 }
