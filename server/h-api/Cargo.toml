@@ -23,5 +23,7 @@ chrono = { workspace = true }
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+bytes.workspace = true
 h-metrics.workspace = true
+h-protocol.workspace = true
 h-storage-duckdb.workspace = true
