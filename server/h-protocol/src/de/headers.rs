@@ -277,3 +277,163 @@ impl TcpHeader {
         self.data_offset_flags[1]
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    /// Cast a sized byte buffer to a `Pod` header. Mirrors the `PacketBuf::peek`
+    /// / `consume` idiom (`bytemuck::from_bytes`) used by the L2/L3/L4 decoders.
+    fn hdr<H: Pod + Copy>(bytes: &[u8]) -> H {
+        assert_eq!(bytes.len(), std::mem::size_of::<H>(), "buffer size mismatch");
+        *bytemuck::from_bytes::<H>(bytes)
+    }
+
+    #[test]
+    fn ethernet_ether_type_is_big_endian() {
+        // src/dst MACs are 6 bytes each; ethertype 0x0800 (IPv4) in big-endian.
+        let mut b = [0u8; 14];
+        b[12] = 0x08;
+        b[13] = 0x00;
+        let h = hdr::<EthernetHeader>(&b);
+        assert_eq!(h.ether_type(), ETHERTYPE_IPV4);
+        // 0x86DD → IPv6.
+        b[12] = 0x86;
+        b[13] = 0xDD;
+        assert_eq!(hdr::<EthernetHeader>(&b).ether_type(), ETHERTYPE_IPV6);
+    }
+
+    #[test]
+    fn vlan_ether_type_is_big_endian() {
+        let mut b = [0u8; 4];
+        b[2] = 0x81;
+        b[3] = 0x00;
+        assert_eq!(hdr::<VlanHeader>(&b).ether_type(), ETHERTYPE_VLAN);
+    }
+
+    #[test]
+    fn linux_sll_protocol_is_big_endian() {
+        let mut b = [0u8; 16];
+        b[14] = 0x08;
+        b[15] = 0x00;
+        assert_eq!(hdr::<LinuxSllHeader>(&b).protocol(), ETHERTYPE_IPV4);
+    }
+
+    #[test]
+    fn linux_sll2_protocol_is_big_endian() {
+        let mut b = [0u8; 20];
+        b[0] = 0x86;
+        b[1] = 0xDD;
+        assert_eq!(hdr::<LinuxSll2Header>(&b).protocol(), ETHERTYPE_IPV6);
+    }
+
+    #[test]
+    fn null_header_af_family_is_native_endian() {
+        // AF_INET = 2 in host byte order (the `from_ne_bytes` accessor).
+        let b: [u8; 4] = (AF_INET as u32).to_ne_bytes();
+        assert_eq!(hdr::<NullHeader>(&b).af_family(), AF_INET);
+    }
+
+    #[test]
+    fn mpls_bottom_of_stack_detects_s_bit() {
+        // S bit is the LSB of the third byte.
+        let mut b = [0u8; 4];
+        // bottom-of-stack clear
+        assert!(!hdr::<MplsHeader>(&b).bottom_of_stack());
+        // set the S bit
+        b[2] = 0x01;
+        assert!(hdr::<MplsHeader>(&b).bottom_of_stack());
+        // other bits in byte 2 do not flip the S bit
+        b[2] = 0xFE;
+        assert!(!hdr::<MplsHeader>(&b).bottom_of_stack());
+        b[2] = 0xFF;
+        assert!(hdr::<MplsHeader>(&b).bottom_of_stack());
+    }
+
+    #[test]
+    fn ipv4_accessors() {
+        // ver_ihl = 0x45 (version 4, IHL 5 → 20 bytes), proto TCP (6),
+        // total_length = 0x0040 (big-endian), src/dst 10.0.0.1 / 10.0.0.2.
+        let mut b = [0u8; 20];
+        b[0] = 0x45; // ver=4, ihl=5
+        b[9] = IP_PROTO_TCP;
+        b[2] = 0x00;
+        b[3] = 0x40; // total_length = 64
+        b[12] = 10;
+        b[13] = 0;
+        b[14] = 0;
+        b[15] = 1;
+        b[16] = 10;
+        b[17] = 0;
+        b[18] = 0;
+        b[19] = 2;
+        let h = hdr::<Ipv4Header>(&b);
+        assert_eq!(h.ihl(), 20);
+        assert_eq!(h.total_length(), 64);
+        assert_eq!(h.protocol(), IP_PROTO_TCP);
+        assert_eq!(h.src_ip(), Ipv4Addr::new(10, 0, 0, 1));
+        assert_eq!(h.dst_ip(), Ipv4Addr::new(10, 0, 0, 2));
+
+        // IHL with options (IHL=6 → 24 bytes) and a non-TCP protocol (17=UDP).
+        let mut b2 = b;
+        b2[0] = 0x46; // ver=4, ihl=6
+        b2[9] = 17;
+        let h2 = hdr::<Ipv4Header>(&b2);
+        assert_eq!(h2.ihl(), 24);
+        assert_eq!(h2.protocol(), 17);
+    }
+
+    #[test]
+    fn ipv6_accessors() {
+        let mut b = [0u8; 40];
+        // payload_length = 0x0100 (256) big-endian, next_header = 6 (TCP).
+        b[4] = 0x01;
+        b[5] = 0x00;
+        b[6] = IP_PROTO_TCP;
+        // src = ::1 (src[15] is the last byte of the 16-byte src field, at
+        // buffer index 8+15=23), dst = ::2 (dst[15] at index 24+15=39).
+        b[23] = 1;
+        b[39] = 2;
+        let h = hdr::<Ipv6Header>(&b);
+        assert_eq!(h.payload_length(), 256);
+        assert_eq!(h.next_header(), IP_PROTO_TCP);
+        assert_eq!(h.src_ip(), Ipv6Addr::LOCALHOST);
+        assert_eq!(h.dst_ip(), Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 2));
+    }
+
+    #[test]
+    fn tcp_accessors() {
+        // src_port=0x1234, dst_port=0x0050 (80), seq=0x00000007,
+        // ack=0x00000008, data_offset=5 (→20B), flags=0x18 (PSH|ACK).
+        let mut b = [0u8; 20];
+        b[0] = 0x12;
+        b[1] = 0x34; // src_port
+        b[2] = 0x00;
+        b[3] = 0x50; // dst_port = 80
+        b[4] = 0x00;
+        b[5] = 0x00;
+        b[6] = 0x00;
+        b[7] = 0x07; // seq = 7
+        b[8] = 0x00;
+        b[9] = 0x00;
+        b[10] = 0x00;
+        b[11] = 0x08; // ack = 8
+        b[12] = 0x50; // data offset = 5 (high nibble), reserved low
+        b[13] = 0x18; // flags = PSH|ACK
+        let h = hdr::<TcpHeader>(&b);
+        assert_eq!(h.src_port(), 0x1234);
+        assert_eq!(h.dst_port(), 80);
+        assert_eq!(h.seq(), 7);
+        assert_eq!(h.ack(), 8);
+        assert_eq!(h.data_offset(), 20);
+        assert_eq!(h.flags(), 0x18);
+
+        // Data offset with options: high nibble = 8 → 32-byte header.
+        let mut b2 = b;
+        b2[12] = 0x80;
+        let h2 = hdr::<TcpHeader>(&b2);
+        assert_eq!(h2.data_offset(), 32);
+        assert_eq!(h2.flags(), 0x18); // flags byte is unchanged
+    }
+}
