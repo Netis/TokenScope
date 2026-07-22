@@ -320,6 +320,10 @@ CI publishes coverage numbers on every PR but never fails on the threshold
 alone — it's a visibility tier, not a gate. The local `gate` sub-command is the
 enforcing tier.
 
+The console has a component-test harness (Bun + happy-dom + Testing Library) —
+render React components and assert on the DOM with `bun test`. See
+[console/test/TESTING.md](console/test/TESTING.md) for how to write one.
+
 Run `just help` for the full menu. Design docs under [docs/design/](docs/design/)
 describe the per-module contract — read the relevant one before changing anything
 load-bearing.
