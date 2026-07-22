@@ -171,3 +171,47 @@ pub fn to_dimension_filter(
         tool_surfaces: parse_csv(tool_surface),
     }
 }
+
+#[cfg(test)]
+mod to_dimension_filter_tests {
+    use super::to_dimension_filter;
+
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn all_none_yields_empty_lists() {
+        let f = to_dimension_filter(&None, &None, &None, &None);
+        assert!(f.wire_apis.is_empty());
+        assert!(f.models.is_empty());
+        assert!(f.server_ips.is_empty());
+        assert!(f.tool_surfaces.is_empty());
+    }
+
+    #[test]
+    fn csv_inputs_parse_into_each_dimension() {
+        // Every dimension is an independent CSV list — one comma value does
+        // NOT leak across dimensions, and trailing/leading spaces are trimmed.
+        let f = to_dimension_filter(
+            &Some("anthropic, openai-chat".to_string()),
+            &Some("gpt-4".to_string()),
+            &Some("10.0.0.1,10.0.0.2".to_string()),
+            &Some("mcp,cli".to_string()),
+        );
+        assert_eq!(f.wire_apis, v(&["anthropic", "openai-chat"]));
+        assert_eq!(f.models, v(&["gpt-4"]));
+        assert_eq!(f.server_ips, v(&["10.0.0.1", "10.0.0.2"]));
+        assert_eq!(f.tool_surfaces, v(&["mcp", "cli"]));
+    }
+
+    #[test]
+    fn empty_string_dimensions_are_treated_as_unset() {
+        // An empty CSV string is indistinguishable from `None` — both yield an
+        // empty (match-any) list, never a single empty-string element.
+        let f = to_dimension_filter(&Some(String::new()), &Some(String::new()), &None, &None);
+        assert!(f.wire_apis.is_empty());
+        assert!(f.models.is_empty());
+    }
+}
+

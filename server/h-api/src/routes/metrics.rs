@@ -251,3 +251,37 @@ pub async fn finish_reasons(
     let series = storage.query_finish_reasons(&query).await?;
     Ok(ApiResponse::ok(FinishReasonsData { series }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn granularity_secs_maps_each_label_to_its_window() {
+        // Mirrors `h_metrics::aggregator::GRANULARITIES`. The caller validates
+        // the label first, so the fallthrough arm (`_ => 60`) is only a safety
+        // net — exercise it anyway so it's never silently dead.
+        assert_eq!(granularity_secs("10s"), 10);
+        assert_eq!(granularity_secs("1m"), 60);
+        assert_eq!(granularity_secs("5m"), 300);
+        assert_eq!(granularity_secs("1h"), 3600);
+        assert_eq!(granularity_secs("unknown"), 60, "fallback is 1m");
+    }
+
+    #[test]
+    fn validate_tool_surfaces_accepts_known_rejects_unknown() {
+        for known in VALID_TOOL_SURFACES {
+            assert!(
+                validate_tool_surfaces(&[known.to_string()]).is_ok(),
+                "{known} should be accepted"
+            );
+        }
+        let err = validate_tool_surfaces(&["bogus".to_string()]).unwrap_err();
+        assert!(matches!(err, ApiError::InvalidParam(_)));
+        // A mix containing one bad token still fails (fail-fast, not skip).
+        assert!(validate_tool_surfaces(&["mcp".to_string(), "bogus".to_string()]).is_err());
+        // Empty list = no filter = ok.
+        assert!(validate_tool_surfaces(&[]).is_ok());
+    }
+}
+
