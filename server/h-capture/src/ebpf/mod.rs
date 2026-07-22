@@ -38,6 +38,15 @@ mod source;
 #[cfg(all(target_os = "linux", feature = "ebpf"))]
 pub use source::EbpfSource;
 
+// Pure helpers split out of the Linux/aya-gated `source.rs` so the testable
+// surface — ring-buffer decode (`decode`) and static-target offset resolution
+// (`offsets`) — builds and runs on every host without the BPF toolchain or
+// `CAP_BPF`. The loader imports these; its own code is only aya attach glue.
+// Private modules: only `ebpf`'s siblings (the loader) reach them via the
+// `crate::ebpf::` path; nothing outside the crate needs them.
+mod decode;
+mod offsets;
+
 // Byte-signature scanning for offset-based uprobe attach on symbol-stripped
 // static TLS stacks (Bun/BoringSSL, Phase 3). Pure + cross-platform so the
 // matcher is built and unit-tested on every host, like `synth`.
@@ -538,5 +547,53 @@ mod tests {
         for f in fins.iter().filter(|f| !f.is_heartbeat()) {
             assert!(f.process.is_none());
         }
+    }
+
+    /// End-to-end userspace contract: a raw `h-ebpf-common` ring-buffer record
+    /// (as the BPF program would write) → `decode::decode_event` → the pump →
+    /// synthesized frames, with no kernel, no aya, no `CAP_BPF`. This is the
+    /// path the live loader runs; testing it here means the BPF↔userspace ABI
+    /// stays green on every host.
+    #[test]
+    #[allow(clippy::cast_ptr_alignment)] // deliberate unaligned write (mirrors decode)
+    fn raw_record_decodes_and_pumps_to_frames_without_cap_bpf() {
+        use crate::ebpf::decode::decode_event;
+        use h_ebpf_common::{kind, SslEvent as RawSslEvent, DATA_CAP};
+        use std::collections::HashMap;
+
+        let mut p = pump(vec![]);
+        let mut cache = HashMap::new();
+
+        // A DATA_WRITE record carrying a real request line.
+        let mut raw = RawSslEvent {
+            kind: kind::DATA_WRITE,
+            pid: 100,
+            conn_id: 7,
+            ktime_ns: 1_000_000,
+            seq_off: 0,
+            data_len: 0,
+            comm: [0; h_ebpf_common::COMM_LEN],
+            data: [0; DATA_CAP],
+        };
+        let payload = b"POST /v1/messages HTTP/1.1\r\n\r\n";
+        raw.data_len = payload.len() as u32;
+        raw.comm[..5].copy_from_slice(b"node\0");
+        raw.data[..payload.len()].copy_from_slice(payload);
+        let mut bytes = vec![0u8; RawSslEvent::SIZE];
+        unsafe {
+            std::ptr::write_unaligned(bytes.as_mut_ptr() as *mut RawSslEvent, raw);
+        }
+
+        let ev = decode_event(&bytes, &mut cache).expect("record decodes");
+        // The pump needs the connection opened first (Phase 1: no connect
+        // kprobe, so the loader opens lazily on first data — on_event opens
+        // an unknown conn mid-stream). Feed the Data event directly.
+        let frames = p.on_event(ev);
+        assert_eq!(data_frame_count(&frames), 1, "one segment for the payload");
+        // Process attribution survives the round-trip.
+        let seg = frames.iter().find(|f| !f.is_heartbeat()).unwrap();
+        let proc = seg.process.as_ref().expect("process stamped");
+        assert_eq!(proc.pid, 100);
+        assert_eq!(proc.comm, "node");
     }
 }

@@ -131,6 +131,36 @@ sources leave it `None`.
   tuple plus mid-stream sync, which the wire-API identification (method / URI /
   Host, not IP) is unaffected by.
 
+### Testability split (what's host-tested vs. what isn't)
+
+The eBPF path is split along a hard line — the kernel BPF verifier — so each
+piece is tested where it can be:
+
+- **Host unit-tested on every platform** (no BPF toolchain, no `CAP_BPF`):
+  - `h-ebpf-common` — the shared `#[repr(C)]` `SslEvent` layout / constants /
+    sizes (the contract the BPF program and userspace agree on).
+  - `h-capture` `ebpf/{decode,offsets,sigscan,synth}` — the ring-buffer decoder,
+    the static-target byte-signature offset resolver, the ELF scanner, and the
+    plaintext→TCP-frame synthesizer. These are pure over their inputs; they were
+    hoisted out of the Linux/aya-gated loader precisely so they build and run
+    on macOS dev and the Linux CI alike.
+- **Kernel-only, end-to-end soak-validated** (`ebpf-soak` workflow on staging):
+  - `h-ebpf-prog` — the BPF program itself. Its emit helpers
+    (`emit_chunk_at`, the unrolled `emit_data`, `stream_off`/`set_stream_off`)
+    are `#[inline(always)]` / unrolled because the 5.15 BPF verifier rejects a
+    loop back-edge and a BPF-to-BPF call. That makes them **not
+    verifier-safe** to extract to a callable, host-testable function — so the
+    whole program is the residual BPF-only surface. See
+    [`h-ebpf-prog/README.md`](../../server/h-ebpf-prog/README.md) for the full
+    probe/map/emit-path inventory and the residual-line list.
+
+The `--features ebpf` host-test coverage run (see
+[`scripts/coverage/run_coverage_rs.sh`](../../scripts/coverage/run_coverage_rs.sh))
+instruments whatever userspace unit tests remain behind the feature on a Linux
+host with the BPF toolchain; the aya loader (`ebpf/source.rs`) is excluded from
+that report as an environment-gated integration surface (it needs `CAP_BPF`).
+
+
 Config lives under a `type = "ebpf"` source — see
 [Configure → eBPF source](../configure.md#ebpf--on-host-tls-capture-linux-experimental).
 
