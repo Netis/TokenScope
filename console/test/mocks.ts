@@ -12,13 +12,14 @@
  * `QueryClient` per call, and `resetStore`/`mockFetch` restore originals in an
  * `afterEach` they register themselves (Bun provides `afterEach`).
  */
-import { afterEach } from "bun:test"
+import { afterEach, expect } from "bun:test"
 import {
   QueryClient,
   QueryClientProvider,
   type QueryClientConfig,
 } from "@tanstack/react-query"
-import { render, type RenderOptions, type RenderResult } from "@testing-library/react"
+import { render, renderHook, type RenderHookOptions, type RenderHookResult, type RenderOptions, type RenderResult } from "@testing-library/react"
+import { MemoryRouter, type MemoryRouterProps } from "react-router"
 import * as React from "react"
 import type { ReactNode } from "react"
 import type { UseBoundStore } from "zustand"
@@ -90,6 +91,52 @@ export function setQueryData(
   client.setQueryData(queryKey, data)
 }
 
+/**
+ * `renderHook` already wired with a fresh `QueryClientProvider` (and, when
+ * `router` is set, a `MemoryRouter`). The single shared helper for testing the
+ * console's `useQuery`/`useInfiniteQuery`/`useMutation` hooks — the ones that
+ * pull `start`/`end` off the toolbar store and server state via TanStack Query.
+ *
+ * Each call gets an isolated `QueryClient` (default) so cache state can't leak
+ * between tests; pass `queryClient` to reuse one when you've seeded it with
+ * `setQueryData`. Pass `initialEntries` for hooks that read `useLocation` /
+ * `useSearchParams` (via `useSupportedFilterParams` or directly).
+ *
+ *   const { result } = renderHookWithProviders(() => useServices())
+ *   const { result } = renderHookWithProviders(
+ *     () => useLlmCalls({ page: 1, pageSize: 50, sortBy: "ts", sortOrder: "desc" }),
+ *     { initialEntries: ["/llm-calls?wire_api=anthropic"] },
+ *   )
+ *
+ * Returns the full `renderHook` result (`result.current`, `rerender`,
+ * `unmount`); RTL's self-registered `afterEach` unmounts between tests.
+ */
+export function renderHookWithProviders<Result>(
+  hook: () => Result,
+  opts: {
+    queryClient?: QueryClient
+    /** MemoryRouter initial entries — enables useLocation/useSearchParams. */
+    initialEntries?: MemoryRouterProps["initialEntries"]
+  } = {},
+): RenderHookResult<Result, unknown> {
+  const queryClient = opts.queryClient ?? createTestQueryClient()
+  const wrapper = ({ children }: { children: ReactNode }) => {
+    const inner = React.createElement(QueryClientProvider, { client: queryClient }, children)
+    if (opts.initialEntries) {
+      return React.createElement(MemoryRouter, { initialEntries: opts.initialEntries }, inner)
+    }
+    return inner
+  }
+  // renderHook expects a render fn taking initialProps; ours ignores them.
+  return renderHook((() => hook()) as () => Result, { wrapper } as RenderHookOptions)
+}
+
+/** Await the microtask queue (for `queueMicrotask`-batched URL updates). */
+export function flushMicrotasks(): Promise<void> {
+  return new Promise((resolve) => Promise.resolve().then(() => resolve()))
+}
+
+
 // ── fetch stubbing ───────────────────────────────────────────────────────────
 
 type FetchImpl = typeof globalThis.fetch
@@ -113,6 +160,76 @@ export function mockFetch(handler: (req: RequestInfo | URL, init?: RequestInit) 
   })
   globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) =>
     Promise.resolve(handler(input, init))) as FetchImpl
+}
+
+/**
+ * Record every request URL the stubbed `fetch` receives into a fresh array,
+ * responding with the given `data` (wrapped in the `{code,message,data}`
+ * `ApiResponse` envelope `apiFetch` unwraps). Use this (over a single mutable
+ * `cell`) when a hook may refetch under parallel-test contention — assert on
+ * the request via `findRequest(urls, expected, endpoint)` so a stray refetch
+ * from another query (often a different endpoint / params) can't clobber the
+ * one you care about.
+ *
+ *   const urls = captureRequests({ services: [] })
+ *   const req = qsOf(findRequest(urls, { start: "1000" }, "/api/services"))
+ *   expect(req.get("end")).toBe("2000")
+ *   expect(result.current.data).toEqual({ services: [] })
+ *
+ * The array is per-call; the underlying `mockFetch` self-restores afterEach.
+ */
+export function captureRequests(data: unknown = {}): string[] {
+  const urls: string[] = []
+  mockFetch((input) => {
+    urls.push(String(input))
+    return jsonResponse({ code: 0, message: "ok", data })
+  })
+  return urls
+}
+
+/** Parse the query string of a captured request URL into URLSearchParams. */
+export function qsOf(url: string): URLSearchParams {
+  return new URLSearchParams(url.split("?")[1] ?? "")
+}
+
+/**
+ * Find a captured request whose path starts with `endpoint` (when given) and
+ * whose query params match `expected`. For each key in `expected`:
+ *   - `undefined` (or absent) → param is ignored (may be present or absent);
+ *   - `null` → the param must be ABSENT (asserts "this filter is omitted");
+ *   - a string → the param must be present with that value.
+ *
+ * Asserting on the returned request's `qsOf` (rather than a single mutable
+ * `cell.url`) is robust to parallel-test contention: a stray refetch from
+ * another query can't masquerade as this one unless it carries the exact same
+ * endpoint + params, so a real "the hook sent the wrong params" bug still
+ * fails.
+ *
+ *   const req = qsOf(findRequest(urls, { start: "1000", end: "2000", model: null }, "/api/services"))
+ *   expect(req.get("wire_api")).toBe("anthropic")
+ *
+ * Throws (via expect) when no request matches, so failures name the missing
+ * combination rather than silently passing.
+ */
+export function findRequest(
+  urls: string[],
+  expected: Record<string, string | null | undefined>,
+  endpoint?: string,
+): string {
+  const match = urls.find((u) => {
+    if (endpoint !== undefined && !u.startsWith(endpoint)) return false
+    const qs = qsOf(u)
+    return Object.entries(expected).every(([k, v]) => {
+      if (v === undefined) return true
+      if (v === null) return !qs.has(k)
+      return qs.get(k) === v
+    })
+  })
+  expect(
+    match,
+    `no captured request to ${endpoint ?? "(any)"} matched ${JSON.stringify(expected)} (got: ${JSON.stringify(urls)})`,
+  ).toBeDefined()
+  return match as string
 }
 
 /** Build a `Response` whose body is `JSON.stringify(body)` (default 200). */
@@ -143,6 +260,40 @@ export function resetStore<S extends object>(
 ): void {
   store.setState(initialState as Partial<S>, false)
 }
+
+// ── hook-test environment ────────────────────────────────────────────────────
+
+/**
+ * Pin `Date.now()` to a fixed value for the duration of a test, returning a
+ * restore fn. Many console hooks derive their window (start/end) from
+ * `Date.now()` at call time; a fixed clock makes param assertions exact.
+ *
+ *   const restore = pinClock(1_780_000_000 * 1000)
+ *   afterEach(restore)
+ */
+export function pinClock(fixedMs: number): () => void {
+  const orig = Date.now
+  // @ts-expect-error — narrowing the global getter is intentional in tests
+  Date.now = () => fixedMs
+  return () => {
+    Date.now = orig
+  }
+}
+
+/**
+ * Point the happy-dom window at a real origin. `apiFetch` builds request URLs
+ * with `new URL(path, window.location.origin)`, but happy-dom loads the page
+ * as `about:blank` → origin is the string `"null"` → `new URL(path, "null")`
+ * throws. Call once in a hook test file's `beforeAll` so every fetch-bearing
+ * hook resolves its URL. Each test file gets its own `Window` from the preload,
+ * so this is file-scoped (it doesn't leak into other files' DOMs).
+ *
+ *   beforeAll(() => setWindowOrigin("http://localhost:8080/"))
+ */
+export function setWindowOrigin(href: string): void {
+  window.location.href = href
+}
+
 
 // ── shared teardown ──────────────────────────────────────────────────────────
 
