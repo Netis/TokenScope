@@ -308,6 +308,18 @@ just quality all     # rust fmt + clippy + ts lint + tsc
 just test all        # cargo test (all crates)
 ```
 
+Optional coverage report (`just test coverage` for the full menu):
+
+```bash
+just test coverage rs   # Rust (cargo-llvm-cov, merged incl. fault-injection)
+just test coverage ts   # Console (bun test --coverage)
+just test coverage gate # Hard-fail locally if either stack < 90%
+```
+
+CI publishes coverage numbers on every PR but never fails on the threshold
+alone — it's a visibility tier, not a gate. The local `gate` sub-command is the
+enforcing tier.
+
 Run `just help` for the full menu. Design docs under [docs/design/](docs/design/)
 describe the per-module contract — read the relevant one before changing anything
 load-bearing.
