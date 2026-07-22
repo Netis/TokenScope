@@ -51,6 +51,39 @@ fn cutoff_micros(t: SystemTime) -> Result<i64> {
         .map_err(|_| AppError::Storage("retention cutoff out of i64 range".to_string()))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn cutoff_micros_known_time_to_epoch_micros() {
+        // 1_700_000_000 s since epoch → 1.7e15 µs, a value in the realistic
+        // LLM-traffic range (2023-11-14 UTC).
+        let t = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        assert_eq!(cutoff_micros(t).unwrap(), 1_700_000_000_000_000);
+    }
+
+    #[test]
+    fn cutoff_micros_preserves_subsecond_micros() {
+        let t = SystemTime::UNIX_EPOCH + Duration::from_micros(1_234_567);
+        assert_eq!(cutoff_micros(t).unwrap(), 1_234_567);
+    }
+
+    #[test]
+    fn cutoff_micros_epoch_is_zero() {
+        assert_eq!(cutoff_micros(SystemTime::UNIX_EPOCH).unwrap(), 0);
+    }
+
+    #[test]
+    fn cutoff_micros_before_epoch_is_err() {
+        // A time strictly before the UNIX epoch errors (the predicate would
+        // otherwise produce a nonsensical negative micros literal).
+        let before = SystemTime::UNIX_EPOCH - Duration::from_secs(1);
+        assert!(cutoff_micros(before).is_err());
+    }
+}
+
 impl ClickHouseBackend {
     /// Count the rows that match `predicate` on `table` (best-effort — see the
     /// module docs). Used to populate the `RetentionReport` since ClickHouse

@@ -145,6 +145,15 @@ struct CallEndpointRow {
     client_ip: String,
 }
 
+/// One turn's proxy role / pair_id + its first call_id, the in-Rust join input
+/// for the no-JOIN two-step topology edge builder. Hoisted to module scope so
+/// the pure edge builders are unit-testable without a live server.
+struct TurnInfo {
+    proxy_role: String,
+    pair_id: String,
+    first_call_id: String,
+}
+
 impl ClickHouseBackend {
     /// "Services" view — aggregate `spans` by `(server_ip, server_port)`.
     /// Port of the DuckDB `query_services`; see that fn + `StorageBackend::
@@ -492,11 +501,6 @@ impl ClickHouseBackend {
             .map_err(|e| ch_err("query_services_topology turns", e))?;
 
         // Per-turn first call_id + role/pair_id. Skip turns with no calls.
-        struct TurnInfo {
-            proxy_role: String,
-            pair_id: String,
-            first_call_id: String,
-        }
         let mut turn_infos: Vec<TurnInfo> = Vec::with_capacity(turn_rows.len());
         let mut wanted_ids: HashSet<String> = HashSet::new();
         for t in turn_rows {
@@ -541,53 +545,7 @@ impl ClickHouseBackend {
         // pair_id non-empty, and from != to (drop dup-capture self-pairs).
         // Counted by number of (a,b) turn pairs, then aggregated by endpoint
         // quad — matching DuckDB's COUNT(*) GROUP BY both endpoints.
-        let mut by_pair_in: HashMap<&str, Vec<(String, u16)>> = HashMap::new();
-        let mut by_pair_out: HashMap<&str, Vec<(String, u16)>> = HashMap::new();
-        for ti in &turn_infos {
-            if ti.pair_id.is_empty() {
-                continue;
-            }
-            let ep = match endpoint_by_id.get(&ti.first_call_id) {
-                Some((ip, port, _client)) => (ip.clone(), *port),
-                None => continue,
-            };
-            if ti.proxy_role == "proxy_in" {
-                by_pair_in.entry(ti.pair_id.as_str()).or_default().push(ep);
-            } else if ti.proxy_role == "proxy_out" {
-                by_pair_out.entry(ti.pair_id.as_str()).or_default().push(ep);
-            }
-        }
-        // Aggregate (from_ip, from_port, to_ip, to_port) → turn_count, the
-        // self-join COUNT(*): for each pair_id, every proxy_in × every
-        // proxy_out is one pairing.
-        let mut proxy_counts: HashMap<(String, u16, String, u16), u64> = HashMap::new();
-        for (pair_id, ins) in &by_pair_in {
-            if let Some(outs) = by_pair_out.get(pair_id) {
-                for (fi, fp) in ins {
-                    for (ti, tp) in outs {
-                        // Drop same-endpoint pairs (multi-interface dup capture,
-                        // not a real proxy hop).
-                        if fi == ti && fp == tp {
-                            continue;
-                        }
-                        *proxy_counts
-                            .entry((fi.clone(), *fp, ti.clone(), *tp))
-                            .or_insert(0) += 1;
-                    }
-                }
-            }
-        }
-        let proxy_edges: Vec<TopologyEdge> = proxy_counts
-            .into_iter()
-            .map(|((fi, fp, ti, tp), c)| TopologyEdge {
-                from_ip: fi,
-                from_port: fp,
-                to_ip: ti,
-                to_port: tp,
-                turn_count: c,
-                kind: "proxy".to_string(),
-            })
-            .collect();
+        let proxy_edges = build_proxy_edges(&turn_infos, &endpoint_by_id);
 
         // --- Inbound entry edges, grouped by (caller_ip, to_ip, to_port).
         // DuckDB excludes proxy_out turns (their inbound side is the proxy hop,
@@ -728,5 +686,184 @@ impl ClickHouseBackend {
         }
 
         Ok(ServicesTopology { nodes, edges })
+    }
+}
+
+/// Build the proxy-hop edges of the service topology in Rust (the no-JOIN
+/// equivalent of the DuckDB `turn_endpoint` self-join). For each `pair_id`,
+/// every `proxy_in` turn's endpoint × every `proxy_out` turn's endpoint is one
+/// pairing, counted and aggregated by the `(from_ip, from_port, to_ip,
+/// to_port)` quad — matching DuckDB's `COUNT(*) GROUP BY both endpoints`.
+/// Same-endpoint pairs (multi-interface dup capture, not a real proxy hop) are
+/// dropped. Turns whose `first_call_id` is not in `endpoint_by_id` are skipped
+/// (the call hasn't flushed). Extracted as a pure fn for offline testability.
+fn build_proxy_edges(
+    turn_infos: &[TurnInfo],
+    endpoint_by_id: &HashMap<String, (String, u16, String)>,
+) -> Vec<TopologyEdge> {
+    let mut by_pair_in: HashMap<&str, Vec<(String, u16)>> = HashMap::new();
+    let mut by_pair_out: HashMap<&str, Vec<(String, u16)>> = HashMap::new();
+    for ti in turn_infos {
+        if ti.pair_id.is_empty() {
+            continue;
+        }
+        let ep = match endpoint_by_id.get(&ti.first_call_id) {
+            Some((ip, port, _client)) => (ip.clone(), *port),
+            None => continue,
+        };
+        if ti.proxy_role == "proxy_in" {
+            by_pair_in.entry(ti.pair_id.as_str()).or_default().push(ep);
+        } else if ti.proxy_role == "proxy_out" {
+            by_pair_out.entry(ti.pair_id.as_str()).or_default().push(ep);
+        }
+    }
+    // Aggregate (from_ip, from_port, to_ip, to_port) → turn_count, the
+    // self-join COUNT(*): for each pair_id, every proxy_in × every proxy_out is
+    // one pairing.
+    let mut proxy_counts: HashMap<(String, u16, String, u16), u64> = HashMap::new();
+    for (pair_id, ins) in &by_pair_in {
+        if let Some(outs) = by_pair_out.get(pair_id) {
+            for (fi, fp) in ins {
+                for (ti, tp) in outs {
+                    // Drop same-endpoint pairs (multi-interface dup capture,
+                    // not a real proxy hop).
+                    if fi == ti && fp == tp {
+                        continue;
+                    }
+                    *proxy_counts
+                        .entry((fi.clone(), *fp, ti.clone(), *tp))
+                        .or_insert(0) += 1;
+                }
+            }
+        }
+    }
+    proxy_counts
+        .into_iter()
+        .map(|((fi, fp, ti, tp), c)| TopologyEdge {
+            from_ip: fi,
+            from_port: fp,
+            to_ip: ti,
+            to_port: tp,
+            turn_count: c,
+            kind: "proxy".to_string(),
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn valid_sort_fields_is_whitelisted() {
+        // sort_by is interpolated into ORDER BY, so an unknown field must be
+        // rejected up front — the whitelist is the gate. Every entry is a
+        // plain identifier (no injection surface).
+        for &known in VALID_SORT_FIELDS {
+            assert!(known.chars().all(|c| c.is_alphanumeric() || c == '_'));
+        }
+        assert!(VALID_SORT_FIELDS.contains(&"call_count"));
+        assert!(VALID_SORT_FIELDS.contains(&"server_port"));
+        assert!(!VALID_SORT_FIELDS.contains(&"bogus"));
+    }
+
+    /// Small helper: a turn whose first call resolved to `endpoint`.
+    fn turn(role: &str, pair_id: &str, first_call_id: &str) -> TurnInfo {
+        TurnInfo {
+            proxy_role: role.into(),
+            pair_id: pair_id.into(),
+            first_call_id: first_call_id.into(),
+        }
+    }
+
+    /// `endpoint_by_id` maps call_id → (server_ip, server_port, client_ip).
+    fn endpoints(ids: &[(&str, &str, u16, &str)]) -> HashMap<String, (String, u16, String)> {
+        ids.iter()
+            .map(|(id, ip, port, client)| (id.to_string(), (ip.to_string(), *port, client.to_string())))
+            .collect()
+    }
+
+    #[test]
+    fn build_proxy_edges_pairs_in_and_out_per_pair_id() {
+        // Two proxy_in turns and one proxy_out turn on the same pair_id, on
+        // distinct endpoints → 2 proxy edges (each in × the single out).
+        let turns = vec![
+            turn("proxy_in", "p1", "c_in1"),
+            turn("proxy_in", "p1", "c_in2"),
+            turn("proxy_out", "p1", "c_out"),
+        ];
+        let eps = endpoints(&[("c_in1", "10.0.0.1", 8080, "10.1.0.1"),
+                              ("c_in2", "10.0.0.1", 8080, "10.1.0.2"),
+                              ("c_out", "10.0.0.2", 443, "10.1.0.1")]);
+        let edges = build_proxy_edges(&turns, &eps);
+        assert_eq!(edges.len(), 2);
+        assert!(edges.iter().all(|e| e.kind == "proxy"));
+        // Both edges point at the proxy_out endpoint.
+        assert!(edges.iter().all(|e| e.to_ip == "10.0.0.2" && e.to_port == 443));
+        // turn_count is 1 each (one (in, out) pairing per in).
+        assert!(edges.iter().all(|e| e.turn_count == 1));
+    }
+
+    #[test]
+    fn build_proxy_edges_drops_same_endpoint_self_pairs() {
+        // proxy_in and proxy_out resolve to the SAME endpoint → a dup-capture
+        // self-pair, dropped (multi-interface capture, not a real hop).
+        let turns = vec![
+            turn("proxy_in", "p1", "c_in"),
+            turn("proxy_out", "p1", "c_out"),
+        ];
+        let eps = endpoints(&[("c_in", "10.0.0.1", 8080, "10.1.0.1"),
+                              ("c_out", "10.0.0.1", 8080, "10.1.0.1")]);
+        assert!(build_proxy_edges(&turns, &eps).is_empty());
+    }
+
+    #[test]
+    fn build_proxy_edges_ignores_empty_pair_id_and_unresolved() {
+        // Empty pair_id → skip. first_call_id not in endpoint_by_id → skip.
+        let turns = vec![
+            turn("proxy_in", "", "c_in"),         // empty pair_id
+            turn("proxy_out", "p1", "c_missing"),  // endpoint unresolved
+        ];
+        let eps = endpoints(&[("c_in", "10.0.0.1", 8080, "x")]);
+        assert!(build_proxy_edges(&turns, &eps).is_empty());
+    }
+
+    #[test]
+    fn build_proxy_edges_aggregates_repeated_endpoint_pairs() {
+        // Two proxy_in turns on the SAME endpoint × one proxy_out → one edge
+        // with turn_count = 2 (the (a,b) pair count aggregates).
+        let turns = vec![
+            turn("proxy_in", "p1", "c_in1"),
+            turn("proxy_in", "p1", "c_in2"),
+            turn("proxy_out", "p1", "c_out"),
+        ];
+        let eps = endpoints(&[("c_in1", "10.0.0.1", 8080, "x"),
+                              ("c_in2", "10.0.0.1", 8080, "y"),
+                              ("c_out", "10.0.0.2", 443, "z")]);
+        let edges = build_proxy_edges(&turns, &eps);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].turn_count, 2);
+        assert_eq!(edges[0].from_ip, "10.0.0.1");
+        assert_eq!(edges[0].from_port, 8080);
+        assert_eq!(edges[0].to_ip, "10.0.0.2");
+        assert_eq!(edges[0].to_port, 443);
+    }
+
+    #[test]
+    fn build_proxy_edges_separates_pair_ids() {
+        // Two distinct pair_ids never cross-pair.
+        let turns = vec![
+            turn("proxy_in", "p1", "a_in"),
+            turn("proxy_out", "p1", "a_out"),
+            turn("proxy_in", "p2", "b_in"),
+            turn("proxy_out", "p2", "b_out"),
+        ];
+        let eps = endpoints(&[("a_in", "1.1.1.1", 1, "x"), ("a_out", "2.2.2.2", 2, "x"),
+                              ("b_in", "3.3.3.3", 3, "x"), ("b_out", "4.4.4.4", 4, "x")]);
+        let edges = build_proxy_edges(&turns, &eps);
+        assert_eq!(edges.len(), 2);
+        // Each pair_id produced exactly one (from,to) edge.
+        assert!(edges.iter().any(|e| e.from_ip == "1.1.1.1" && e.to_ip == "2.2.2.2"));
+        assert!(edges.iter().any(|e| e.from_ip == "3.3.3.3" && e.to_ip == "4.4.4.4"));
     }
 }

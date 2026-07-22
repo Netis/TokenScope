@@ -79,49 +79,10 @@ impl ClickHouseBackend {
     ) -> Result<Vec<String>> {
         // `traces` is a ReplacingMergeTree, so reads must use FINAL to see
         // the latest version per turn_id.
-        let mut where_parts = vec![time_where(
-            "start_time",
-            query.time_range.start_us,
-            query.time_range.end_us,
-        )];
-
-        if !query.filter.wire_apis.is_empty() {
-            where_parts.push(format!(
-                "wire_api IN ({})",
-                sql_in_list(&query.filter.wire_apis)
-            ));
-        }
-        if !query.filter.models.is_empty() {
-            // `models_used` is stored as a JSON string array. DuckDB uses
-            // `list_has_any`; the ClickHouse equivalent parses the JSON to
-            // `Array(String)` and tests overlap with the filter list.
-            where_parts.push(format!(
-                "hasAny(JSONExtract(coalesce(models_used, '[]'), 'Array(String)'), [{}])",
-                sql_in_list(&query.filter.models)
-            ));
-        }
-        if !query.filter.server_ips.is_empty() {
-            where_parts.push(format!(
-                "server_ip IN ({})",
-                sql_in_list(&query.filter.server_ips)
-            ));
-        }
-        if !query.include_proxy_hops {
-            // `metadata` is Nullable(String) holding JSON. JSONExtractString
-            // returns '' when the path is absent, so DuckDB's `IS NULL` maps to
-            // `= ''`; the role exclusion stays an explicit NOT IN list.
-            where_parts.push(
-                "(JSONExtractString(coalesce(metadata, ''), 'proxy', 'role') = '' \
-                   OR JSONExtractString(coalesce(metadata, ''), 'proxy', 'role') \
-                      NOT IN ('proxy_out', 'mirror_secondary'))"
-                    .to_string(),
-            );
-        }
-
         let sql = format!(
             "SELECT DISTINCT agent_kind AS v FROM traces FINAL \
              WHERE {} ORDER BY agent_kind",
-            where_parts.join(" AND ")
+            distinct_agent_kinds_where_sql(query)
         );
         let rows = self
             .client
@@ -155,5 +116,106 @@ impl ClickHouseBackend {
                 finish_reason: r.finish_reason,
             })
             .collect())
+    }
+}
+
+/// Build the `query_distinct_agent_kinds` WHERE clause: a half-open
+/// `start_time` time range AND-ed with every present dimension filter plus,
+/// when `include_proxy_hops` is false, a proxy-role exclusion. Extracted as a
+/// pure fn so the escaping / IN-list / JSON-array / proxy-hop assembly is
+/// unit-testable without a live server. `traces` is a ReplacingMergeTree, so
+/// the caller wraps the result in `FROM traces FINAL`.
+pub(crate) fn distinct_agent_kinds_where_sql(query: &DistinctAgentKindsQuery) -> String {
+    let mut where_parts = vec![time_where(
+        "start_time",
+        query.time_range.start_us,
+        query.time_range.end_us,
+    )];
+
+    if !query.filter.wire_apis.is_empty() {
+        where_parts.push(format!("wire_api IN ({})", sql_in_list(&query.filter.wire_apis)));
+    }
+    if !query.filter.models.is_empty() {
+        // `models_used` is stored as a JSON string array. DuckDB uses
+        // `list_has_any`; the ClickHouse equivalent parses the JSON to
+        // `Array(String)` and tests overlap with the filter list.
+        where_parts.push(format!(
+            "hasAny(JSONExtract(coalesce(models_used, '[]'), 'Array(String)'), [{}])",
+            sql_in_list(&query.filter.models)
+        ));
+    }
+    if !query.filter.server_ips.is_empty() {
+        where_parts.push(format!("server_ip IN ({})", sql_in_list(&query.filter.server_ips)));
+    }
+    if !query.include_proxy_hops {
+        // `metadata` is Nullable(String) holding JSON. JSONExtractString returns
+        // '' when the path is absent, so DuckDB's `IS NULL` maps to `= ''`; the
+        // role exclusion stays an explicit NOT IN list.
+        where_parts.push(
+            "(JSONExtractString(coalesce(metadata, ''), 'proxy', 'role') = '' \
+               OR JSONExtractString(coalesce(metadata, ''), 'proxy', 'role') \
+                  NOT IN ('proxy_out', 'mirror_secondary'))"
+                .to_string(),
+        );
+    }
+    where_parts.join(" AND ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use h_storage::query::{DimensionFilter, TimeRange};
+
+    fn q() -> DistinctAgentKindsQuery {
+        DistinctAgentKindsQuery {
+            time_range: TimeRange { start_us: 100, end_us: 200 },
+            filter: DimensionFilter::default(),
+            include_proxy_hops: false,
+        }
+    }
+
+    #[test]
+    fn default_excludes_proxy_hops() {
+        let s = distinct_agent_kinds_where_sql(&q());
+        assert!(s.starts_with("start_time >= fromUnixTimestamp64Micro(100)"));
+        assert!(s.contains("start_time < fromUnixTimestamp64Micro(200)"));
+        // Proxy exclusion: role = '' OR role NOT IN (proxy_out, mirror_secondary).
+        assert!(s.contains("JSONExtractString(coalesce(metadata, ''), 'proxy', 'role') = ''"));
+        assert!(s.contains("NOT IN ('proxy_out', 'mirror_secondary')"));
+    }
+
+    #[test]
+    fn include_proxy_hops_omits_exclusion() {
+        let query = DistinctAgentKindsQuery { include_proxy_hops: true, ..q() };
+        let s = distinct_agent_kinds_where_sql(&query);
+        assert!(!s.contains("proxy_out"));
+    }
+
+    #[test]
+    fn models_uses_hasany_json_extract() {
+        let query = DistinctAgentKindsQuery {
+            filter: DimensionFilter {
+                models: vec!["gpt-4".into()],
+                ..Default::default()
+            },
+            ..q()
+        };
+        assert!(distinct_agent_kinds_where_sql(&query)
+            .contains("hasAny(JSONExtract(coalesce(models_used, '[]'), 'Array(String)'), ['gpt-4'])"));
+    }
+
+    #[test]
+    fn dimension_in_lists_escape_quotes() {
+        let query = DistinctAgentKindsQuery {
+            filter: DimensionFilter {
+                wire_apis: vec!["a'b".into()],
+                server_ips: vec!["10.0.0.2".into()],
+                ..Default::default()
+            },
+            ..q()
+        };
+        let s = distinct_agent_kinds_where_sql(&query);
+        assert!(s.contains("wire_api IN ('a''b')"));
+        assert!(s.contains("server_ip IN ('10.0.0.2')"));
     }
 }

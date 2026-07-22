@@ -76,6 +76,212 @@ fn now_micros() -> u64 {
         .unwrap_or(0)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_proxy_fields_missing_metadata() {
+        let (role, peer, peer_ids) = extract_proxy_fields(None);
+        assert_eq!(role, None);
+        assert_eq!(peer, None);
+        assert_eq!(peer_ids, None);
+    }
+
+    #[test]
+    fn extract_proxy_fields_non_json_metadata() {
+        let (role, peer, peer_ids) = extract_proxy_fields(Some("not-json".into()));
+        assert_eq!(role, None);
+        assert_eq!(peer, None);
+        assert_eq!(peer_ids, None);
+    }
+
+    #[test]
+    fn extract_proxy_fields_json_without_proxy() {
+        let (role, peer, peer_ids) =
+            extract_proxy_fields(Some(r#"{"other":"value"}"#.into()));
+        assert_eq!(role, None);
+        assert_eq!(peer, None);
+        assert_eq!(peer_ids, None);
+    }
+
+    #[test]
+    fn extract_proxy_fields_role_only() {
+        let (role, peer, peer_ids) =
+            extract_proxy_fields(Some(r#"{"proxy":{"role":"proxy_in"}}"#.into()));
+        assert_eq!(role.as_deref(), Some("proxy_in"));
+        assert_eq!(peer, None);
+        assert_eq!(peer_ids, None);
+    }
+
+    #[test]
+    fn extract_proxy_fields_role_and_peer_turn_id() {
+        let (role, peer, peer_ids) = extract_proxy_fields(Some(
+            r#"{"proxy":{"role":"proxy_out","peer_turn_id":"turn-42"}}"#.into(),
+        ));
+        assert_eq!(role.as_deref(), Some("proxy_out"));
+        assert_eq!(peer.as_deref(), Some("turn-42"));
+        assert_eq!(peer_ids, None);
+    }
+
+    #[test]
+    fn extract_proxy_fields_peer_turn_ids_array() {
+        let (role, _peer, peer_ids) = extract_proxy_fields(Some(
+            r#"{"proxy":{"role":"proxy_in","peer_turn_ids":["turn-1","turn-2"]}}"#.into(),
+        ));
+        assert_eq!(role.as_deref(), Some("proxy_in"));
+        assert_eq!(
+            peer_ids,
+            Some(vec!["turn-1".to_string(), "turn-2".to_string()])
+        );
+    }
+
+    #[test]
+    fn extract_proxy_fields_handles_sweeper_patch_shape() {
+        // The real patch the pair sweeper writes via update_trace_metadata:
+        // {"proxy":{"role":...,"pair_id":...,"peer_turn_id":...,"peer_turn_ids":[...]}}.
+        let raw = r#"{"proxy":{"role":"proxy_in","pair_id":"pair-7","peer_turn_id":"turn-out","peer_turn_ids":["x","y"]}}"#;
+        let (role, peer, peer_ids) = extract_proxy_fields(Some(raw.into()));
+        assert_eq!(role.as_deref(), Some("proxy_in"));
+        assert_eq!(peer.as_deref(), Some("turn-out"));
+        assert_eq!(peer_ids, Some(vec!["x".to_string(), "y".to_string()]));
+        // pair_id is not surfaced by this helper (only role + peer_turn_id[s]).
+    }
+
+    #[test]
+    fn extract_proxy_fields_peer_turn_ids_not_array_is_none() {
+        // A non-array peer_turn_ids (e.g. a string) yields None, not a crash.
+        let (_role, _peer, peer_ids) = extract_proxy_fields(Some(
+            r#"{"proxy":{"role":"proxy_in","peer_turn_ids":"oops"}}"#.into(),
+        ));
+        assert_eq!(peer_ids, None);
+    }
+
+    #[test]
+    fn turn_row_select_lists_span_ids_as_micros() {
+        // The read-modify-write SELECT must surface the two DateTime64(6) cols
+        // as i64 micros (via toUnixTimestamp64Micro) so they deserialize into
+        // TurnRow's i64 fields and re-insert round-trip. This is a compile-time
+        // invariant of the constant; the test pins the two aliases.
+        assert!(TURN_ROW_SELECT.contains("toUnixTimestamp64Micro(start_time) AS start_time"));
+        assert!(TURN_ROW_SELECT.contains("toUnixTimestamp64Micro(end_time) AS end_time"));
+        // span_ids read as the raw JSON String column (no transform).
+        assert!(TURN_ROW_SELECT.contains("span_ids"));
+        // _version read back so it can be bumped on re-insert.
+        assert!(TURN_ROW_SELECT.contains("_version"));
+    }
+
+    #[test]
+    fn traces_valid_sort_fields_is_whitelisted() {
+        for &known in TRACES_VALID_SORT_FIELDS {
+            assert!(known.chars().all(|c| c.is_alphanumeric() || c == '_'));
+        }
+        assert!(TRACES_VALID_SORT_FIELDS.contains(&"start_time"));
+        assert!(TRACES_VALID_SORT_FIELDS.contains(&"call_count"));
+        assert!(!TRACES_VALID_SORT_FIELDS.contains(&"bogus"));
+    }
+
+    fn traces_query() -> TracesQuery {
+        TracesQuery {
+            time_range: TimeRange { start_us: 100, end_us: 200 },
+            filter: DimensionFilter::default(),
+            client_ips: vec![],
+            server_ports: vec![],
+            statuses: vec![],
+            agent_kinds: vec![],
+            sort_by: "start_time".into(),
+            sort_order: "desc".into(),
+            page: 1,
+            page_size: 10,
+            include_proxy_hops: false,
+        }
+    }
+
+    #[test]
+    fn traces_where_sql_default_hides_proxy_hops() {
+        // include_proxy_hops = false (default) appends the proxy exclusion.
+        let s = traces_where_sql(&traces_query());
+        assert!(s.starts_with("start_time >= fromUnixTimestamp64Micro(100)"));
+        assert!(s.contains("start_time < fromUnixTimestamp64Micro(200)"));
+        assert!(s.contains("NOT IN ('proxy_out', 'mirror_secondary')"));
+    }
+
+    #[test]
+    fn traces_where_sql_include_proxy_hops_omits_exclusion() {
+        let q = TracesQuery {
+            include_proxy_hops: true,
+            ..traces_query()
+        };
+        assert!(!traces_where_sql(&q).contains("NOT IN ('proxy_out'"));
+    }
+
+    #[test]
+    fn traces_where_sql_models_uses_hasany_json_extract() {
+        let q = TracesQuery {
+            filter: DimensionFilter {
+                models: vec!["gpt-4".into()],
+                ..Default::default()
+            },
+            ..traces_query()
+        };
+        let s = traces_where_sql(&q);
+        // models_used is a JSON-array String → hasAny(JSONExtract(..., 'Array(String)'), [...]).
+        assert!(s.contains("hasAny(JSONExtract(coalesce(models_used, '[]'), 'Array(String)'), ['gpt-4'])"));
+    }
+
+    #[test]
+    fn traces_where_sql_server_ports_uses_in_subquery_not_join() {
+        // traces has no server_port → resolve the turn's first call_id against
+        // spans via an uncorrelated IN-subquery (NOT a JOIN). Assert the shape
+        // and that no literal "JOIN" keyword is introduced.
+        let q = TracesQuery {
+            server_ports: vec![8080, 443],
+            ..traces_query()
+        };
+        let s = traces_where_sql(&q);
+        assert!(s.contains("arrayElement(JSONExtract(span_ids, 'Array(String)'), 1) IN"));
+        assert!(s.contains("SELECT id FROM spans WHERE server_port IN (8080, 443)"));
+        assert!(!s.to_lowercase().contains(" join "));
+        assert!(!s.contains(" JOIN "));
+    }
+
+    #[test]
+    fn traces_where_sql_combines_dimension_filters() {
+        let q = TracesQuery {
+            filter: DimensionFilter {
+                wire_apis: vec!["openai-chat".into()],
+                server_ips: vec!["10.0.0.2".into()],
+                ..Default::default()
+            },
+            statuses: vec!["complete".into()],
+            agent_kinds: vec!["claude-cli".into()],
+            client_ips: vec!["10.0.0.1".into()],
+            ..traces_query()
+        };
+        let s = traces_where_sql(&q);
+        assert!(s.contains("wire_api IN ('openai-chat')"));
+        assert!(s.contains("server_ip IN ('10.0.0.2')"));
+        assert!(s.contains("status IN ('complete')"));
+        assert!(s.contains("agent_kind IN ('claude-cli')"));
+        assert!(s.contains("client_ip IN ('10.0.0.1')"));
+        assert!(!s.starts_with(" AND"));
+        assert!(!s.ends_with("AND "));
+    }
+
+    #[test]
+    fn traces_where_sql_escapes_user_lists() {
+        let q = TracesQuery {
+            filter: DimensionFilter {
+                wire_apis: vec!["a'b".into()],
+                ..Default::default()
+            },
+            ..traces_query()
+        };
+        // A quote in a wire_api value is doubled (no breakout).
+        assert!(traces_where_sql(&q).contains("wire_api IN ('a''b')"));
+    }
+}
+
 #[derive(Row, Deserialize)]
 struct TurnListRow {
     turn_id: String,
@@ -159,6 +365,78 @@ struct CountRow {
     n: u64,
 }
 
+/// Valid `sort_by` fields for `query_traces`. Hoisted to module scope so the
+/// reject-unknown-sort path is unit-testable without a live client (the value
+/// is interpolated into `ORDER BY`). Mirrors the DuckDB whitelist.
+const TRACES_VALID_SORT_FIELDS: &[&str] = &[
+    "start_time",
+    "end_time",
+    "duration_ms",
+    "call_count",
+    "total_input_tokens",
+    "total_output_tokens",
+];
+
+/// Build the `query_traces` WHERE clause: a half-open `start_time` time range
+/// AND-ed with every present dimension + per-call filter. Extracted as a pure
+/// fn so the escaping / IN-list / JSON-array / IN-subquery / proxy-hop
+/// assembly is unit-testable without a live server. The `server_ports` filter
+/// uses an uncorrelated IN-subquery (NOT a JOIN) because `traces` carries no
+/// `server_port`; the proxy-hop exclusion hides sweeper-folded hops.
+pub(crate) fn traces_where_sql(query: &TracesQuery) -> String {
+    let mut where_parts = vec![time_where(
+        "start_time",
+        query.time_range.start_us,
+        query.time_range.end_us,
+    )];
+    if !query.filter.wire_apis.is_empty() {
+        where_parts.push(format!("wire_api IN ({})", sql_in_list(&query.filter.wire_apis)));
+    }
+    if !query.filter.models.is_empty() {
+        // models_used is a JSON-array String; match if any requested model is
+        // present (DuckDB list_has_any → ClickHouse hasAny).
+        where_parts.push(format!(
+            "hasAny(JSONExtract(coalesce(models_used, '[]'), 'Array(String)'), [{}])",
+            sql_in_list(&query.filter.models)
+        ));
+    }
+    if !query.statuses.is_empty() {
+        where_parts.push(format!("status IN ({})", sql_in_list(&query.statuses)));
+    }
+    if !query.agent_kinds.is_empty() {
+        where_parts.push(format!("agent_kind IN ({})", sql_in_list(&query.agent_kinds)));
+    }
+    if !query.client_ips.is_empty() {
+        where_parts.push(format!("client_ip IN ({})", sql_in_list(&query.client_ips)));
+    }
+    if !query.server_ports.is_empty() {
+        // traces has no server_port; resolve via the turn's first call_id
+        // against spans. ClickHouse can't do the DuckDB correlated EXISTS, so
+        // use an uncorrelated IN-subquery (still not a JOIN): the turn's first
+        // call_id ∈ { calls on those ports }.
+        let ports: Vec<String> = query.server_ports.iter().map(|p| p.to_string()).collect();
+        where_parts.push(format!(
+            "arrayElement(JSONExtract(span_ids, 'Array(String)'), 1) IN \
+             (SELECT id FROM spans WHERE server_port IN ({}))",
+            ports.join(", ")
+        ));
+    }
+    if !query.filter.server_ips.is_empty() {
+        where_parts.push(format!("server_ip IN ({})", sql_in_list(&query.filter.server_ips)));
+    }
+    if !query.include_proxy_hops {
+        // Hide the sweeper-folded hops. JSONExtractString returns '' when
+        // absent, and '' NOT IN (...) is true, so direct turns +
+        // proxy_in/mirror_primary stay visible.
+        where_parts.push(
+            "JSONExtractString(coalesce(metadata, ''), 'proxy', 'role') \
+             NOT IN ('proxy_out', 'mirror_secondary')"
+                .to_string(),
+        );
+    }
+    where_parts.join(" AND ")
+}
+
 impl ClickHouseBackend {
     pub(crate) async fn write_traces(&self, turns: Vec<Trace>) -> Result<()> {
         let rows: Vec<TurnRow> = turns.into_iter().map(TurnRow::from).collect();
@@ -167,77 +445,15 @@ impl ClickHouseBackend {
     }
 
     pub(crate) async fn query_traces(&self, query: &TracesQuery) -> Result<TracesPage> {
-        const VALID_SORT_FIELDS: &[&str] = &[
-            "start_time",
-            "end_time",
-            "duration_ms",
-            "call_count",
-            "total_input_tokens",
-            "total_output_tokens",
-        ];
-        if !VALID_SORT_FIELDS.contains(&query.sort_by.as_str()) {
+        if !TRACES_VALID_SORT_FIELDS.contains(&query.sort_by.as_str()) {
             return Err(AppError::Storage(format!(
                 "invalid sort_by field: {}",
                 query.sort_by
             )));
         }
-        let sort_order = if query.sort_order.eq_ignore_ascii_case("ASC") {
-            "ASC"
-        } else {
-            "DESC"
-        };
+        let sort_order = crate::calls::resolve_sort_order(&query.sort_order);
 
-        let mut where_parts = vec![time_where(
-            "start_time",
-            query.time_range.start_us,
-            query.time_range.end_us,
-        )];
-        if !query.filter.wire_apis.is_empty() {
-            where_parts.push(format!("wire_api IN ({})", sql_in_list(&query.filter.wire_apis)));
-        }
-        if !query.filter.models.is_empty() {
-            // models_used is a JSON-array String; match if any requested model
-            // is present (DuckDB list_has_any → ClickHouse hasAny).
-            where_parts.push(format!(
-                "hasAny(JSONExtract(coalesce(models_used, '[]'), 'Array(String)'), [{}])",
-                sql_in_list(&query.filter.models)
-            ));
-        }
-        if !query.statuses.is_empty() {
-            where_parts.push(format!("status IN ({})", sql_in_list(&query.statuses)));
-        }
-        if !query.agent_kinds.is_empty() {
-            where_parts.push(format!("agent_kind IN ({})", sql_in_list(&query.agent_kinds)));
-        }
-        if !query.client_ips.is_empty() {
-            where_parts.push(format!("client_ip IN ({})", sql_in_list(&query.client_ips)));
-        }
-        if !query.server_ports.is_empty() {
-            // traces has no server_port; resolve via the turn's first
-            // call_id against spans. ClickHouse can't do the DuckDB
-            // correlated EXISTS, so use an uncorrelated IN-subquery (still
-            // not a JOIN): the turn's first call_id ∈ { calls on those ports }.
-            let ports: Vec<String> = query.server_ports.iter().map(|p| p.to_string()).collect();
-            where_parts.push(format!(
-                "arrayElement(JSONExtract(span_ids, 'Array(String)'), 1) IN \
-                 (SELECT id FROM spans WHERE server_port IN ({}))",
-                ports.join(", ")
-            ));
-        }
-        if !query.filter.server_ips.is_empty() {
-            where_parts.push(format!("server_ip IN ({})", sql_in_list(&query.filter.server_ips)));
-        }
-        if !query.include_proxy_hops {
-            // Hide the sweeper-folded hops. JSONExtractString returns '' when
-            // absent, and '' NOT IN (...) is true, so direct turns +
-            // proxy_in/mirror_primary stay visible.
-            where_parts.push(
-                "JSONExtractString(coalesce(metadata, ''), 'proxy', 'role') \
-                 NOT IN ('proxy_out', 'mirror_secondary')"
-                    .to_string(),
-            );
-        }
-        let where_sql = where_parts.join(" AND ");
+        let where_sql = traces_where_sql(query);
 
         let total = self
             .client
