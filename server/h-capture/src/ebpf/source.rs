@@ -2,9 +2,10 @@
 //!
 //! Loads the embedded BPF program (`h-ebpf-prog`, built by `build.rs`), attaches
 //! uprobes to `SSL_write` / `SSL_read` / `SSL_shutdown` on the host's `libssl`,
-//! polls the ring buffer, decodes [`RawSslEvent`] records into the
-//! cross-platform [`SslEvent`], and drives an [`EbpfPump`] whose synthesized
-//! [`RawPacket`]s flow into the standard pipeline.
+//! polls the ring buffer, decodes the raw `h-ebpf-common::SslEvent` records
+//! (see `crate::ebpf::decode`) into the cross-platform [`SslEvent`], and
+//! drives an [`EbpfPump`] whose synthesized [`RawPacket`]s flow into the
+//! standard pipeline.
 //!
 //! Phase 1 MVP: no connect-side 5-tuple recovery yet — connections use a
 //! synthetic tuple and the reassembler syncs mid-stream on the first request
@@ -17,7 +18,6 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use bytes::Bytes;
 use tokio::io::unix::AsyncFd;
 use tokio_util::sync::CancellationToken;
 
@@ -28,15 +28,17 @@ use aya::Ebpf;
 
 use h_common::config::{CaptureSourceConfig, EbpfTarget};
 use h_common::internal_metrics::{Metric, MetricsWorker};
-use h_ebpf_common::{kind, SslEvent as RawSslEvent, DATA_CAP};
 
-use crate::ebpf::sigscan::{scan_elf_executable, Signature};
+use crate::ebpf::decode::decode_event;
+use crate::ebpf::offsets::{
+    exe_link_has_basename, resolve_target_offsets, target_has_source,
+};
 use crate::ebpf::{BootClock, EbpfPump, SslEvent};
 use crate::packet::RawPacket;
 use crate::pcap_dump::PacketDumperConfig;
 use crate::routing::RoutingSender;
 use crate::source::CaptureSource;
-use crate::synth::{StreamDir, SynthConfig};
+use crate::synth::SynthConfig;
 
 /// The uprobe links installed on one target inode: the `(program_name,
 /// link_id)` pairs returned by each [`UProbe::attach`]. We keep the ids so the
@@ -320,69 +322,6 @@ impl CaptureSource for EbpfSource {
     }
 }
 
-/// Cap on the pid→exe memo so a long capture across heavy pid churn can't grow
-/// it without bound. Cleared wholesale on overflow (cheap; re-warms on demand).
-const EXE_CACHE_CAP: usize = 4096;
-
-/// Decode one ring-buffer record into a cross-platform [`SslEvent`].
-fn decode_event(bytes: &[u8], exe_cache: &mut HashMap<u32, Option<String>>) -> Option<SslEvent> {
-    if bytes.len() < RawSslEvent::SIZE {
-        return None;
-    }
-    // The ring buffer gives an unaligned slice; read the POD struct unaligned.
-    let raw: RawSslEvent = unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const RawSslEvent) };
-    let comm = comm_to_string(&raw.comm);
-    match raw.kind {
-        kind::CLOSE => Some(SslEvent::Close {
-            conn_id: raw.conn_id,
-            ktime_ns: raw.ktime_ns,
-        }),
-        kind::DATA_WRITE | kind::DATA_READ => {
-            let len = (raw.data_len as usize).min(DATA_CAP);
-            let dir = if raw.kind == kind::DATA_WRITE {
-                StreamDir::ClientToServer
-            } else {
-                StreamDir::ServerToClient
-            };
-            Some(SslEvent::Data {
-                conn_id: raw.conn_id,
-                pid: raw.pid,
-                comm,
-                exe: resolve_exe(raw.pid, exe_cache),
-                dir,
-                data: Bytes::copy_from_slice(&raw.data[..len]),
-                seq_off: raw.seq_off,
-                ktime_ns: raw.ktime_ns,
-            })
-        }
-        _ => None,
-    }
-}
-
-/// Best-effort `/proc/<pid>/exe` resolution, memoized. Returns the absolute
-/// executable path, or `None` when the link can't be read (process exited,
-/// permission denied). Requires the capturing process to out-rank the target —
-/// satisfied when running as root / CAP_SYS_PTRACE, which the eBPF source needs
-/// anyway.
-fn resolve_exe(pid: u32, cache: &mut HashMap<u32, Option<String>>) -> Option<String> {
-    if let Some(v) = cache.get(&pid) {
-        return v.clone();
-    }
-    if cache.len() >= EXE_CACHE_CAP {
-        cache.clear();
-    }
-    let resolved = std::fs::read_link(format!("/proc/{pid}/exe"))
-        .ok()
-        .map(|p| p.to_string_lossy().into_owned());
-    cache.insert(pid, resolved.clone());
-    resolved
-}
-
-fn comm_to_string(comm: &[u8]) -> String {
-    let end = comm.iter().position(|&b| b == 0).unwrap_or(comm.len());
-    String::from_utf8_lossy(&comm[..end]).into_owned()
-}
-
 /// Load a BPF program by name. Called once per program before any attach,
 /// because the kernel rejects a second `load()` while the program is attached
 /// at multiple sites (each libssl + each static target).
@@ -476,127 +415,11 @@ fn detach_links(ebpf: &mut Ebpf, links: InodeLinks) {
     }
 }
 
-/// Built-in BoringSSL prologue signatures for a flavor, using the anchor + window
-/// technique. `SSL_read`'s prologue is distinctive enough to match uniquely; the
-/// `SSL_write` prologue is generic (a common register-save sequence appears many
-/// times), so it is located as the nearest match in a window *after* the
-/// `SSL_read` anchor — robust to the small per-build drift in the inter-function
-/// distance that a hardcoded delta would miss.
-struct FlavorSig {
-    /// Distinctive `SSL_read` prologue — must match uniquely (the anchor).
-    read_sig: &'static str,
-    /// `SSL_write` prologue — generic; resolved as the first match within
-    /// `write_window` bytes after the `SSL_read` anchor.
-    write_sig: &'static str,
-    write_window: u64,
-}
-
-/// Built-in signatures per flavor. Returns `None` for `boringssl` (generic): a
-/// prologue is specific to one statically-linked build, so a bare `boringssl`
-/// target must supply `write_sig`/`read_sig`/`*_offset` in config.
-///
-/// The `bun` signatures are the BoringSSL `SSL_read`/`SSL_write` x86-64
-/// prologues from Bun v1.3.x profile builds (the runtime Claude Code ships),
-/// matching the read-anchored, windowed-write approach from the eunomia-bpf
-/// AgentSight project (MIT). They are still version-bound data — a future Bun
-/// line may shift the prologue; override via config when that happens.
-fn flavor_signatures(flavor: &str) -> Option<FlavorSig> {
-    match flavor {
-        "bun" | "boringssl-bun" | "claude-code" => Some(FlavorSig {
-            read_sig: "55 48 89 e5 41 57 41 56 53 50 48 83 bf 98 00 00 00 00 74",
-            write_sig:
-                "55 48 89 e5 41 57 41 56 41 55 41 54 53 48 83 ec 18 41 89 d7 49 89 f6 48 89 fb",
-            write_window: 0x10000,
-        }),
-        _ => None,
-    }
-}
-
-/// Locate a function as the first signature match within `window` bytes after an
-/// `anchor` offset. Used for the generic `SSL_write` prologue once the unique
-/// `SSL_read` anchor is known — handles a prologue that occurs many times across
-/// the binary by scoping to the SSL function's neighborhood.
-fn resolve_windowed(
-    data: &[u8],
-    pattern: &str,
-    anchor: u64,
-    window: u64,
-    what: &str,
-    binary: &str,
-) -> Option<u64> {
-    let sig = Signature::parse(pattern)?;
-    let hit = scan_elf_executable(data, &sig)
-        .into_iter()
-        .find(|&o| o >= anchor && o < anchor.saturating_add(window));
-    match hit {
-        Some(off) => {
-            tracing::info!("ebpf: {binary}: {what} resolved at offset {off:#x} (anchored)");
-            Some(off)
-        }
-        None => {
-            tracing::warn!(
-                "ebpf: {binary}: {what} not found within {window:#x} of anchor {anchor:#x}"
-            );
-            None
-        }
-    }
-}
-
-/// Resolve a unique uprobe file offset for `pattern` in `data`. Requires
-/// exactly one match: zero means a stale/wrong signature (skip, don't attach
-/// blindly), and more than one is ambiguous (a too-loose signature would attach
-/// the probe to the wrong function). Both cases log and return `None`.
-fn resolve_single_offset(data: &[u8], pattern: &str, what: &str, binary: &str) -> Option<u64> {
-    let Some(sig) = Signature::parse(pattern) else {
-        tracing::warn!("ebpf: {binary}: malformed {what} signature {pattern:?}");
-        return None;
-    };
-    let hits = scan_elf_executable(data, &sig);
-    match hits.as_slice() {
-        [] => {
-            tracing::warn!("ebpf: {binary}: {what} signature matched nothing (wrong build?)");
-            None
-        }
-        [off] => {
-            tracing::info!("ebpf: {binary}: {what} resolved at offset {off:#x}");
-            Some(*off)
-        }
-        many => {
-            tracing::warn!(
-                "ebpf: {binary}: {what} signature is ambiguous ({} matches) — refine it",
-                many.len()
-            );
-            None
-        }
-    }
-}
-
 /// How often to re-scan target processes for new inodes (auto-update rotation)
 /// and freshly-spawned sessions. Short enough that a new Claude Code / opencode
 /// session is captured within seconds of starting; cheap (a `/proc` walk plus a
 /// signature scan only for inodes not seen before).
 const RESCAN_INTERVAL_SECS: u64 = 15;
-
-/// Does this target carry enough config to resolve uprobe offsets at all?
-/// (an explicit offset, a config signature, or a flavor with built-in sigs.)
-fn target_has_source(target: &EbpfTarget) -> bool {
-    target.write_offset.is_some()
-        || target.read_offset.is_some()
-        || target.write_sig.is_some()
-        || target.read_sig.is_some()
-        || flavor_signatures(&target.flavor).is_some()
-}
-
-/// True if a `/proc/<pid>/exe` readlink target has the given basename. The
-/// kernel suffixes the link with `" (deleted)"` once the binary is unlinked by
-/// an auto-update, so strip that first. Matching by **basename** (not full path)
-/// is what lets us re-attach across npm's atomic-rename upgrade, which stages the
-/// new build in a `.<pkg>-<hash>/` dir before renaming it over the install path —
-/// the running process's exe then points into that now-deleted staging dir.
-fn exe_link_has_basename(link: &str, basename: &str) -> bool {
-    let path = link.strip_suffix(" (deleted)").unwrap_or(link);
-    Path::new(path).file_name().and_then(|f| f.to_str()) == Some(basename)
-}
 
 /// (dev, inode) identity of `path`, following symlinks — so `/proc/<pid>/exe`
 /// resolves to the real (possibly deleted) inode. Returns `None` if it can't be
@@ -626,61 +449,6 @@ fn target_pids(basename: &str) -> Vec<u32> {
         }
     }
     pids
-}
-
-/// Resolve SSL_read/SSL_write **file offsets** for a target from the given
-/// binary `data` (config offsets first, then config signatures, then built-in
-/// flavor signatures). Pure over `data` — same bytes always yield the same
-/// offsets, so a per-inode result can be cached as "seen".
-fn resolve_target_offsets(
-    data: &[u8],
-    target: &EbpfTarget,
-    label: &str,
-) -> (Option<u64>, Option<u64>) {
-    let mut read_off = target.read_offset;
-    let mut write_off = target.write_offset;
-    if read_off.is_some() && write_off.is_some() {
-        return (read_off, write_off);
-    }
-
-    // Config-supplied signatures take precedence and must match uniquely.
-    if read_off.is_none() {
-        if let Some(p) = &target.read_sig {
-            read_off = resolve_single_offset(data, p, "SSL_read", label);
-        }
-    }
-    if write_off.is_none() {
-        if let Some(p) = &target.write_sig {
-            write_off = resolve_single_offset(data, p, "SSL_write", label);
-        }
-    }
-
-    // Fall back to built-in flavor signatures: anchor on the unique SSL_read
-    // prologue, then locate SSL_write (generic prologue) as the nearest match in
-    // the window after it.
-    if let Some(fs) = flavor_signatures(&target.flavor) {
-        if read_off.is_none() {
-            read_off = resolve_single_offset(data, fs.read_sig, "SSL_read", label);
-        }
-        if write_off.is_none() {
-            match read_off {
-                Some(anchor) => {
-                    write_off = resolve_windowed(
-                        data,
-                        fs.write_sig,
-                        anchor,
-                        fs.write_window,
-                        "SSL_write",
-                        label,
-                    );
-                }
-                None => tracing::warn!(
-                    "ebpf: {label}: no SSL_read anchor — cannot locate SSL_write by window"
-                ),
-            }
-        }
-    }
-    (read_off, write_off)
 }
 
 /// Attach the (already-loaded) SSL uprobes to `attach_path` at the resolved
@@ -887,75 +655,4 @@ fn bump_memlock_rlimit() -> std::io::Result<()> {
         return Err(std::io::Error::last_os_error());
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn target(binary: &str, flavor: &str) -> EbpfTarget {
-        EbpfTarget {
-            binary: binary.to_string(),
-            flavor: flavor.to_string(),
-            write_sig: None,
-            read_sig: None,
-            write_offset: None,
-            read_offset: None,
-        }
-    }
-
-    #[test]
-    fn exe_link_basename_matches_plain_path() {
-        assert!(exe_link_has_basename(
-            "/home/user/.nvm/.../claude-code/bin/claude.exe",
-            "claude.exe"
-        ));
-    }
-
-    #[test]
-    fn exe_link_basename_matches_through_deleted_suffix() {
-        // After an npm atomic-rename auto-update the running process's exe points
-        // into the now-unlinked staging dir; the kernel appends " (deleted)".
-        // Basename matching must see through both the staging dir and the suffix.
-        assert!(exe_link_has_basename(
-            "/home/user/.nvm/.../@anthropic-ai/.claude-code-BLnYIOGh/bin/claude.exe (deleted)",
-            "claude.exe"
-        ));
-        assert!(exe_link_has_basename(
-            "/home/user/.nvm/.../opencode-ai/bin/opencode.exe (deleted)",
-            "opencode.exe"
-        ));
-    }
-
-    #[test]
-    fn exe_link_basename_rejects_other_binaries() {
-        assert!(!exe_link_has_basename("/usr/bin/node", "claude.exe"));
-        assert!(!exe_link_has_basename(
-            "/some/where/claude.exe.bak (deleted)",
-            "claude.exe"
-        ));
-    }
-
-    #[test]
-    fn target_has_source_requires_offset_sig_or_flavor() {
-        // Bare boringssl flavor with no offsets/sigs → not enough to attach.
-        assert!(!target_has_source(&target("/x/claude.exe", "boringssl")));
-        // A known flavor with built-in signatures is enough.
-        assert!(target_has_source(&target("/x/claude.exe", "bun")));
-        // An explicit offset is enough regardless of flavor.
-        let mut t = target("/x/claude.exe", "boringssl");
-        t.read_offset = Some(0x1000);
-        assert!(target_has_source(&t));
-    }
-
-    #[test]
-    fn resolve_offsets_passes_config_offsets_through_without_scanning() {
-        let mut t = target("/x/claude.exe", "boringssl");
-        t.read_offset = Some(0x4165_5e0);
-        t.write_offset = Some(0x4165_970);
-        // Empty data would make any scan fail; config offsets must short-circuit.
-        let (r, w) = resolve_target_offsets(&[], &t, "test");
-        assert_eq!(r, Some(0x4165_5e0));
-        assert_eq!(w, Some(0x4165_970));
-    }
 }

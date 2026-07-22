@@ -24,6 +24,14 @@ show_help() {
     echo "   just test coverage rs       Rust only (merged report incl. fault-injection)"
     echo "   just test coverage ts       Console only (denominator over src/**)"
     echo "   just test coverage gate     Hard-fail if either < HERON_COV_MIN (default 90)"
+    echo ""
+    echo "   eBPF measurement exception: the Rust run also attempts a"
+    echo "   --features ebpf userspace run on Linux (nightly BPF toolchain only;"
+    echo "   skipped otherwise). The aya loader (h-capture/src/ebpf/source.rs) is"
+    echo "   excluded from the report — it needs CAP_BPF + the BPF toolchain to"
+    echo "   build and has no host unit tests. The pure eBPF layout/decoder/"
+    echo "   offset/synth modules are NOT excluded (host-tested contract). See"
+    echo "   server/h-ebpf-prog/README.md for the BPF inventory + residual lines."
 }
 
 run_rs() {

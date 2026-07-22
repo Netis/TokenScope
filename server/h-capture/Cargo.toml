@@ -8,8 +8,13 @@ license.workspace = true
 # eBPF SSL-uprobe capture (Linux only). Off by default so macOS dev builds and
 # the Linux CI stay green without the aya/BPF toolchain. Enables the aya loader
 # (`src/ebpf/source.rs`) + the out-of-band BPF program build (build.rs +
-# aya-build). The cross-platform pump (`src/ebpf/mod.rs`) is always built/tested.
-ebpf = ["dep:aya", "dep:h-ebpf-common", "tokio/net"]
+# aya-build). The cross-platform pump (`src/ebpf/mod.rs`), the ring-buffer
+# decoder (`src/ebpf/decode.rs`), and the static-target offset resolver
+# (`src/ebpf/offsets.rs`) are always built/tested — only the aya loader is
+# feature-gated. `h-ebpf-common` is a plain (non-optional) dep because the
+# decoder, always compiled, needs the shared `SslEvent` layout; that crate is
+# dependency-free `no_std` so it builds on every host.
+ebpf = ["dep:aya", "tokio/net"]
 
 [dependencies]
 h-common.workspace = true
@@ -24,12 +29,16 @@ thiserror.workspace = true
 tokio-util.workspace = true
 serde.workspace = true
 snap = "1"
+# The shared `SslEvent` ring-buffer layout — dependency-free `no_std`, so it
+# builds on every host. Always a dep: the cross-platform decoder
+# (`src/ebpf/decode.rs`) reads it back from raw bytes and is built/tested
+# everywhere (not just behind the `ebpf` feature).
+h-ebpf-common = { path = "../h-ebpf-common" }
 
 # eBPF deps are Linux-only and optional (pulled in only by the `ebpf` feature),
 # so neither macOS nor a default Linux build compiles them.
 [target.'cfg(target_os = "linux")'.dependencies]
 aya = { version = "0.13", optional = true }
-h-ebpf-common = { path = "../h-ebpf-common", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

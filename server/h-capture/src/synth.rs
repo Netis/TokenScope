@@ -685,4 +685,144 @@ mod tests {
         let frames = s.data(1, StreamDir::ClientToServer, &body, 0, 0);
         assert_eq!(frames.len(), 2, "default segment size still chunks");
     }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // Reassembler contract invariants (see the module-level docs).
+    //
+    // The reassembler (`h-protocol`) derives each segment's on-wire length from
+    // the IP/TCP header fields and discards a flow whose claimed length exceeds
+    // the captured bytes. These tests pin the synthesizer's half of that
+    // contract directly on the emitted bytes — no parser dependency — so a
+    // regression that would truncate or pad a frame is caught here.
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// IPv4 `total_length` (bytes 16..18 of the IPv4 header).
+    fn ipv4_total_length(pkt: &RawPacket) -> u16 {
+        let ip = ETH_HDR_LEN;
+        u16::from_be_bytes([pkt.data[ip + 2], pkt.data[ip + 3]])
+    }
+
+    /// IPv6 `payload_length` (bytes 4..6 of the IPv6 header).
+    fn ipv6_payload_length(pkt: &RawPacket) -> u16 {
+        let ip = ETH_HDR_LEN;
+        u16::from_be_bytes([pkt.data[ip + 4], pkt.data[ip + 5]])
+    }
+
+    /// IPv4 header checksum (bytes 10..12) — left zero, never validated.
+    fn ipv4_checksum(pkt: &RawPacket) -> u16 {
+        let ip = ETH_HDR_LEN;
+        u16::from_be_bytes([pkt.data[ip + 10], pkt.data[ip + 11]])
+    }
+
+    /// TCP checksum (offset 16..18 in the TCP header) — left zero.
+    fn tcp_checksum(pkt: &RawPacket) -> u16 {
+        let tcp = ETH_HDR_LEN + IPV4_HDR_LEN;
+        u16::from_be_bytes([pkt.data[tcp + 16], pkt.data[tcp + 17]])
+    }
+
+    #[test]
+    fn ipv4_total_length_covers_exactly_headers_plus_payload() {
+        // The reassembler's truncation guard requires
+        // `wire_payload_len == payload.len()`. The synthesizer sets the IPv4
+        // total_length to exactly IPV4(20) + TCP(20) + payload — no more, no
+        // less — so the segment is never misread as truncated/overlong.
+        let mut s = FlowSynthesizer::new(SynthConfig::default());
+        s.open(1, v4_tuple(), 0);
+        for body in [
+            b"".as_slice(),
+            b"GET / HTTP/1.1\r\n".as_slice(),
+            &[b'A'; 40_000][..],
+        ] {
+            let frames = s.data(1, StreamDir::ClientToServer, body, 0, 10);
+            for f in &frames {
+                let (_, _, payload) = ipv4_tcp(f);
+                assert_eq!(
+                    ipv4_total_length(f) as usize,
+                    IPV4_HDR_LEN + TCP_HDR_LEN + payload.len(),
+                    "total_length must cover exactly the carried payload"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ipv6_payload_length_covers_tcp_header_plus_payload() {
+        let mut s = FlowSynthesizer::new(SynthConfig::default());
+        let tuple = ConnTuple {
+            client: "[2001:db8::1]:50000".parse().unwrap(),
+            server: "[2606:4700::1]:443".parse().unwrap(),
+        };
+        s.open(1, tuple, 0);
+        let body = b"POST /v1/messages HTTP/1.1\r\n\r\n";
+        let frames = s.data(1, StreamDir::ClientToServer, body, 0, 0);
+        for f in &frames {
+            let tcp = ETH_HDR_LEN + IPV6_HDR_LEN;
+            let payload = &f.data[tcp + TCP_HDR_LEN..];
+            assert_eq!(
+                ipv6_payload_length(f) as usize,
+                TCP_HDR_LEN + payload.len(),
+                "IPv6 payload_length must cover TCP header + payload"
+            );
+        }
+    }
+
+    #[test]
+    fn checksums_are_left_zero() {
+        // No checksums are computed (the L3/L4 decoders don't validate them);
+        // the fields stay zero so a future validator isn't fed stale garbage.
+        let mut s = FlowSynthesizer::new(SynthConfig::default());
+        s.open(1, v4_tuple(), 0);
+        let f = &s.data(1, StreamDir::ClientToServer, b"hi", 0, 0)[0];
+        assert_eq!(ipv4_checksum(f), 0);
+        assert_eq!(tcp_checksum(f), 0);
+    }
+
+    #[test]
+    fn frames_are_never_heartbeats() {
+        // Synthetic frames carry a real IP ethertype (0x0800 / 0x86dd), never
+        // the 0xFFFF heartbeat sentinel, so `is_heartbeat()` is false for
+        // every emitted SYN/SYN-ACK/data/FIN — the reassembler parses them.
+        let mut s = FlowSynthesizer::new(SynthConfig::default());
+        let handshake = s.open(1, v4_tuple(), 0);
+        for f in &handshake {
+            assert!(!f.is_heartbeat());
+            assert_eq!(ethertype(f), ETHERTYPE_IPV4);
+        }
+        let data = s.data(1, StreamDir::ClientToServer, b"GET / HTTP/1.1\r\n", 0, 0);
+        for f in &data {
+            assert!(!f.is_heartbeat());
+        }
+        let fins = s.close(1, 99);
+        for f in &fins {
+            assert!(!f.is_heartbeat());
+        }
+    }
+
+    #[test]
+    fn seq_advances_by_payload_len_per_direction() {
+        // Sequence numbers advance monotonically per direction by the emitted
+        // payload length; there are no retransmits or out-of-order frames. Two
+        // sequential writes leave a contiguous, gapless c2s sequence space.
+        let mut s = FlowSynthesizer::new(SynthConfig::default());
+        s.open(1, v4_tuple(), 0);
+        let a = s.data(1, StreamDir::ClientToServer, b"AAAA", 0, 0);
+        let b = s.data(1, StreamDir::ClientToServer, b"BB", 4, 1);
+        let (seq_a, _, pl_a) = ipv4_tcp(&a[0]);
+        let (seq_b, _, pl_b) = ipv4_tcp(&b[0]);
+        assert_eq!(seq_a, 1);
+        assert_eq!(seq_b, seq_a + pl_a.len() as u32, "second write continues the stream");
+        assert_eq!(pl_b.len(), 2);
+    }
+
+    #[test]
+    fn caplen_equals_wirelen_equals_frame_len() {
+        // Synthetic frames are never snaplen-truncated: caplen == wirelen ==
+        // the full emitted length, so the reassembler sees the whole segment.
+        let mut s = FlowSynthesizer::new(SynthConfig::default());
+        s.open(1, v4_tuple(), 0);
+        let f = &s.data(1, StreamDir::ClientToServer, b"POST /v1/messages HTTP/1.1\r\n", 0, 0)[0];
+        assert_eq!(f.caplen, f.wirelen);
+        assert_eq!(f.caplen as usize, f.data.len());
+        assert_eq!(f.link_type, LINKTYPE_ETHERNET);
+    }
 }
