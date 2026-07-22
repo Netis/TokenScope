@@ -1,0 +1,13 @@
+# Bun configuration for the console. Auto-read by `bun install` and `bun test`.
+#
+# The `[test] preload` makes the component-test harness available to every
+# test file without each one importing it: it registers a happy-dom global
+# DOM, attaches @testing-library/jest-dom matchers, and sets the React act
+# environment. See test/setup.ts for the details and test/TESTING.md for how
+# to write a component test.
+#
+# Coverage is configured by `just test coverage ts` (scripts/coverage/
+# run_coverage_ts.sh) via CLI flags, not here — keep this file limited to the
+# test preload so coverage runs and plain `bun test` stay identical.
+[test]
+preload = ["./test/setup.ts"]
