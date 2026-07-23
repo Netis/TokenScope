@@ -61,3 +61,13 @@ g.IS_REACT_ACT_ENVIRONMENT = true
 // Top-level await (supported in Bun ESM) guarantees `screen` is built against
 // the live `document` rather than its throwing stub.
 await import("@testing-library/jest-dom")
+
+// ── 3. generous async wait timeout ──────────────────────────────────────────
+// `bun test` runs many files concurrently (one process per worker). Under
+// heavy parallel CPU contention a react-query fetch + React re-render can
+// take longer than RTL's 1000ms `waitFor` default to settle, producing flaky
+// timeouts that aren't real failures. Bump the shared async-utility timeout
+// so hook/component tests stay green regardless of worker load.
+const { configure } = await import("@testing-library/react")
+configure({ asyncUtilTimeout: 5000 })
+
