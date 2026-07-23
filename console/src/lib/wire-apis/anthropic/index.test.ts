@@ -153,3 +153,78 @@ describe("parseAnthropicCall — response", () => {
     expect(call.response.usage.cache_creation_input_tokens).toBe(5)
   })
 })
+
+describe("parseAnthropicCall — content block variants", () => {
+  it("parses a url-source image block", () => {
+    const body = JSON.stringify({
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "image", source: { type: "url", url: "https://x/y.png" }, cache_control: { type: "ephemeral" } },
+          ],
+        },
+      ],
+    })
+    const call = parseAnthropicCall(body, null)
+    const block = call.request.messages[0].content[0]
+    if (block.type === "image") {
+      expect(block.source).toEqual({ type: "url", url: "https://x/y.png" })
+      expect(block.cache_control?.type).toBe("ephemeral")
+    } else {
+      expect(block.type).toBe("image")
+    }
+  })
+
+  it("parses a document block (title + context)", () => {
+    const body = JSON.stringify({
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "document",
+              source: { type: "text", media_type: "text/plain", data: "hello" },
+              title: "doc",
+              context: "ctx",
+              cache_control: { type: "ephemeral" },
+            },
+          ],
+        },
+      ],
+    })
+    const call = parseAnthropicCall(body, null)
+    const block = call.request.messages[0].content[0]
+    if (block.type === "document") {
+      expect(block.title).toBe("doc")
+      expect(block.context).toBe("ctx")
+      expect(block.cache_control?.type).toBe("ephemeral")
+    } else {
+      expect(block.type).toBe("document")
+    }
+  })
+
+  it("parses a redacted_thinking block", () => {
+    const body = JSON.stringify({
+      messages: [
+        { role: "assistant", content: [{ type: "redacted_thinking", data: "opaque-bytes" }] },
+      ],
+    })
+    const call = parseAnthropicCall(body, null)
+    const block = call.request.messages[0].content[0]
+    if (block.type === "redacted_thinking") {
+      expect(block.data).toBe("opaque-bytes")
+    } else {
+      expect(block.type).toBe("redacted_thinking")
+    }
+  })
+
+  it("falls back to an unknown block for an unrecognized type", () => {
+    const body = JSON.stringify({
+      messages: [{ role: "user", content: [{ type: "weird", foo: 1 }] }],
+    })
+    const call = parseAnthropicCall(body, null)
+    const block = call.request.messages[0].content[0]
+    expect(block.type).toBe("unknown")
+  })
+})
