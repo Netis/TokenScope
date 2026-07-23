@@ -253,3 +253,187 @@ impl fmt::Display for LlmMetric {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A metric with every field zeroed — the baseline the avg methods are
+    /// exercised against by mutating the relevant `*_sum`/`*_count` pairs.
+    fn zero_metric() -> LlmMetric {
+        LlmMetric {
+            timestamp_us: 0,
+            source_id: String::new(),
+            granularity: "10s",
+            wire_api: "openai-chat".to_string(),
+            model: "gpt-4".to_string(),
+            server_ip: "10.0.0.2".to_string(),
+            call_count: 0,
+            stream_count: 0,
+            non_stream_count: 0,
+            active_calls_sum: 0,
+            active_calls_sample_count: 0,
+            active_calls_max: 0,
+            total_input_tokens: 0,
+            input_token_count: 0,
+            total_output_tokens: 0,
+            output_token_count: 0,
+            total_cache_read_input_tokens: 0,
+            total_cache_creation_input_tokens: 0,
+            error_count: 0,
+            error_4xx_count: 0,
+            error_429_count: 0,
+            error_5xx_count: 0,
+            ttft_sum: 0.0,
+            ttft_count: 0,
+            ttft_p50: None,
+            ttft_p95: None,
+            ttft_p99: None,
+            ttft_stream_sum: 0.0,
+            ttft_stream_count: 0,
+            ttft_stream_p50: None,
+            ttft_stream_p95: None,
+            ttft_stream_p99: None,
+            ttft_nonstream_sum: 0.0,
+            ttft_nonstream_count: 0,
+            ttft_nonstream_p50: None,
+            ttft_nonstream_p95: None,
+            ttft_nonstream_p99: None,
+            e2e_sum: 0.0,
+            e2e_count: 0,
+            e2e_p50: None,
+            e2e_p95: None,
+            e2e_p99: None,
+            tpot_sum: 0.0,
+            tpot_count: 0,
+            tpot_p50: None,
+            tpot_p95: None,
+            tpot_p99: None,
+            tool_surface: None,
+        }
+    }
+
+    #[test]
+    fn active_calls_avg_zero_when_no_samples() {
+        let mut m = zero_metric();
+        assert_eq!(m.active_calls_avg(), 0.0);
+        m.active_calls_sum = 30;
+        // still zero — sampled against a zero denominator
+        assert_eq!(m.active_calls_avg(), 0.0);
+        m.active_calls_sample_count = 4;
+        assert_eq!(m.active_calls_avg(), 7.5);
+    }
+
+    #[test]
+    fn token_avgs_are_none_when_no_samples() {
+        let m = zero_metric();
+        assert_eq!(m.input_tokens_avg(), None);
+        assert_eq!(m.output_tokens_avg(), None);
+
+        let mut m = zero_metric();
+        m.total_input_tokens = 300;
+        m.input_token_count = 3;
+        assert_eq!(m.input_tokens_avg(), Some(100.0));
+        m.total_output_tokens = 50;
+        m.output_token_count = 0;
+        assert_eq!(m.output_tokens_avg(), None);
+    }
+
+    #[test]
+    fn latency_avgs_are_none_when_no_samples() {
+        assert_eq!(zero_metric().ttft_avg(), None);
+        assert_eq!(zero_metric().ttft_stream_avg(), None);
+        assert_eq!(zero_metric().ttft_nonstream_avg(), None);
+        assert_eq!(zero_metric().e2e_avg(), None);
+        assert_eq!(zero_metric().tpot_avg(), None);
+
+        let mut m = zero_metric();
+        m.ttft_sum = 150.0;
+        m.ttft_count = 3;
+        assert_eq!(m.ttft_avg(), Some(50.0));
+
+        m.ttft_stream_sum = 90.0;
+        m.ttft_stream_count = 3;
+        assert_eq!(m.ttft_stream_avg(), Some(30.0));
+
+        m.ttft_nonstream_sum = 40.0;
+        m.ttft_nonstream_count = 2;
+        assert_eq!(m.ttft_nonstream_avg(), Some(20.0));
+
+        m.e2e_sum = 800.0;
+        m.e2e_count = 4;
+        assert_eq!(m.e2e_avg(), Some(200.0));
+
+        m.tpot_sum = 12.0;
+        m.tpot_count = 4;
+        assert_eq!(m.tpot_avg(), Some(3.0));
+    }
+
+    #[test]
+    fn display_renders_header_traffic_tokens_and_latency_lines() {
+        let mut m = zero_metric();
+        // timestamp_us = 3,661,000,000 µs → 3,661 s → 01:01:01
+        // (h=(3661/3600)%24=1, m=(3661/60)%60=1, s=3661%60=1). Exercises
+        // the private format_ts helper end-to-end.
+        m.timestamp_us = 3_661_000_000;
+        m.granularity = "1m";
+        m.source_id = "src-1".to_string();
+        m.wire_api = "anthropic".to_string();
+        m.model = "claude-3".to_string();
+        m.server_ip = "10.0.0.9".to_string();
+        m.call_count = 5;
+        m.stream_count = 2;
+        m.non_stream_count = 3;
+        m.error_count = 1;
+        m.error_4xx_count = 1;
+        m.error_429_count = 0;
+        m.error_5xx_count = 0;
+        m.active_calls_sum = 10;
+        m.active_calls_sample_count = 2;
+        m.active_calls_max = 7;
+        m.total_input_tokens = 1000;
+        m.total_output_tokens = 500;
+        m.total_cache_read_input_tokens = 250;
+        m.total_cache_creation_input_tokens = 50;
+        m.ttft_sum = 200.0;
+        m.ttft_count = 2;
+        m.ttft_p50 = Some(90.0);
+        m.ttft_p95 = Some(110.0);
+        m.ttft_p99 = Some(120.0);
+        m.e2e_sum = 1000.0;
+        m.e2e_count = 2;
+        m.e2e_p50 = Some(450.0);
+        m.tpot_sum = 8.0;
+        m.tpot_count = 2;
+        m.tpot_p99 = Some(5.0);
+
+        let s = m.to_string();
+        assert!(s.contains("[Metric] 1m | 01:01:01"), "header/ts line: {s}");
+        assert!(s.contains("source=src-1"), "{s}");
+        assert!(s.contains("anthropic / claude-3 / 10.0.0.9"), "{s}");
+        assert!(s.contains("calls=5 (stream=2 non_stream=3)"), "{s}");
+        assert!(
+            s.contains("errors=1 (4xx=1 429=0 5xx=0)"),
+            "{s}"
+        );
+        assert!(s.contains("active_calls avg=5.0 max=7"), "{s}");
+        assert!(s.contains("tokens: in=1000 out=500"), "{s}");
+        assert!(s.contains("cache_read=250 cache_create=50"), "{s}");
+        // ttft avg = 100.0 → "100.0ms"; p50 from the field → "90.0ms"
+        assert!(s.contains("ttft: avg=100.0ms p50=90.0ms"), "{s}");
+        assert!(s.contains("e2e:  avg=500.0ms p50=450.0ms"), "{s}");
+        assert!(s.contains("tpot: avg=4.0ms/t"), "{s}");
+        assert!(s.contains("p99=5.0ms/t"), "{s}");
+    }
+
+    #[test]
+    fn display_emits_dashes_for_unsampled_latency_percentiles() {
+        // With all counts at zero, every avg is None and every percentile is
+        // None — the Display must render "-" placeholders (exercises the
+        // private fmt_opt's None arm).
+        let s = zero_metric().to_string();
+        assert!(s.contains("ttft: avg=- p50=- p95=- p99=-"), "{s}");
+        assert!(s.contains("e2e:  avg=- p50=- p95=- p99=-"), "{s}");
+        assert!(s.contains("tpot: avg=- p50=- p95=- p99=-"), "{s}");
+    }
+}

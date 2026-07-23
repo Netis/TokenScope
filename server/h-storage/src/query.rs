@@ -952,3 +952,72 @@ mod session_turns_cursor_tests {
         assert!(decode_session_turns_cursor("00").is_none()); // valid hex, invalid JSON
     }
 }
+
+#[cfg(test)]
+mod session_list_cursor_tests {
+    use super::*;
+
+    #[test]
+    fn session_list_cursor_roundtrip() {
+        let c = SessionListCursor {
+            last_turn_at_ms: 1_729_000_000_000,
+            source_id: "src-7".to_string(),
+            session_id: "sess-42".to_string(),
+        };
+        let encoded = encode_session_cursor(&c);
+        // Opaque hex — no base64, so every char is a hex digit.
+        assert!(
+            encoded.chars().all(|c| c.is_ascii_hexdigit()),
+            "cursor must be hex, got {encoded}",
+        );
+        let decoded = decode_session_cursor(&encoded).expect("decode");
+        assert_eq!(decoded.last_turn_at_ms, c.last_turn_at_ms);
+        assert_eq!(decoded.source_id, c.source_id);
+        assert_eq!(decoded.session_id, c.session_id);
+    }
+
+    #[test]
+    fn session_list_cursor_roundtrip_preserves_negative_timestamp_and_empty_ids() {
+        let c = SessionListCursor {
+            last_turn_at_ms: -1,
+            source_id: String::new(),
+            session_id: String::new(),
+        };
+        let encoded = encode_session_cursor(&c);
+        let decoded = decode_session_cursor(&encoded).expect("decode");
+        assert_eq!(decoded.last_turn_at_ms, -1);
+        assert!(decoded.source_id.is_empty());
+        assert!(decoded.session_id.is_empty());
+    }
+
+    #[test]
+    fn session_list_cursor_rejects_garbage() {
+        // odd length
+        assert!(decode_session_cursor("abc").is_none());
+        // non-hex digit
+        assert!(decode_session_cursor("zz").is_none());
+        // valid hex, invalid JSON
+        assert!(decode_session_cursor("00").is_none());
+        // valid hex, valid JSON, but not the expected object shape (missing keys)
+        let empty_obj_hex = hex_encode_str("{}");
+        assert!(decode_session_cursor(&empty_obj_hex).is_none());
+    }
+
+    #[test]
+    fn session_list_cursor_rejects_wrong_typed_fields() {
+        // t must be an i64 and s/k must be strings; a JSON object that has the
+        // right keys but wrong types decodes to None.
+        let bad = hex_encode_str(r#"{"t":"not-a-number","s":1,"k":true}"#);
+        assert!(decode_session_cursor(&bad).is_none());
+    }
+
+    /// Tiny local hex-encoder so the test doesn't depend on a hex crate.
+    fn hex_encode_str(s: &str) -> String {
+        let mut out = String::with_capacity(s.len() * 2);
+        for b in s.as_bytes() {
+            use std::fmt::Write;
+            let _ = write!(out, "{b:02x}");
+        }
+        out
+    }
+}
