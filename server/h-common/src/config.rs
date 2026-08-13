@@ -529,6 +529,8 @@ pub struct StorageConfig {
     #[serde(default)]
     pub clickhouse: ClickHouseConfig,
     #[serde(default)]
+    pub sglake: SglakeConfig,
+    #[serde(default)]
     pub sink: StorageSinkConfig,
     #[serde(default)]
     pub retention: RetentionConfig,
@@ -540,6 +542,7 @@ impl Default for StorageConfig {
             backend: default_backend(),
             duckdb: DuckDbConfig::default(),
             clickhouse: ClickHouseConfig::default(),
+            sglake: SglakeConfig::default(),
             sink: StorageSinkConfig::default(),
             retention: RetentionConfig::default(),
         }
@@ -732,6 +735,179 @@ fn default_clickhouse_database() -> String {
 
 fn default_clickhouse_user() -> String {
     "default".to_string()
+}
+
+/// Connection + behaviour settings for the sglake (sglog) storage backend.
+/// Only read when `storage.backend == "sglake"`.
+///
+/// Writes go through the Splunk-compatible HEC (`/services/collector/event`);
+/// reads are SPL over `/api/v1/search`. Heron's five tables map onto a set of
+/// sglake indexes under `index_prefix`: `_spans` / `_bodies` / `_traces` /
+/// `_metrics_<granularity>` / `_finish_<granularity>` / `_http` /
+/// `_http_bodies`. Bodies live in their own indexes so list and aggregate
+/// queries never touch body bytes, and so bodies can expire earlier than the
+/// metadata that references them.
+///
+/// ⚠️ Security: sglogd authenticates HEC with a token but leaves `/api/v1/*`
+/// **unauthenticated**, and serves no HTTPS of its own. Deploy it on a trusted
+/// network or behind a reverse proxy.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SglakeConfig {
+    /// sglogd base URL, e.g. `http://127.0.0.1:5959`.
+    #[serde(default = "default_sglake_url")]
+    pub url: String,
+    /// HEC token. Only needed when sglogd runs with `--hec-token`; the header
+    /// is matched exactly as `Authorization: Splunk <token>`.
+    #[serde(default)]
+    pub hec_token: String,
+    /// Prefix for every index this backend owns. Must avoid sglake's built-in
+    /// names (`main` / `traces` / `metrics` / `summary` / `_internal` / `_audit`)
+    /// — note `traces` in particular is already taken by OTLP spans.
+    #[serde(default = "default_sglake_index_prefix")]
+    pub index_prefix: String,
+    /// Persist request/response bodies and headers. `false` keeps only
+    /// metadata, which is the cheapest possible footprint.
+    #[serde(default = "default_true")]
+    pub store_bodies: bool,
+    /// Retention for the body indexes, in days. `0` inherits
+    /// `storage.retention.spans`.
+    #[serde(default)]
+    pub body_retention_days: u32,
+    /// Push per-index retention to sglake's management API on
+    /// `apply_retention`. When false the call is a no-op and retention is left
+    /// to whoever operates sglogd.
+    #[serde(default = "default_true")]
+    pub manage_retention: bool,
+    /// Max bytes per HEC request, pre-compression. Must stay below sglogd's
+    /// `--max-body-mib` (default 100 MiB) — the limit is enforced on the
+    /// *decompressed* size, so gzip does not buy headroom.
+    #[serde(default = "default_sglake_max_body_bytes")]
+    pub max_body_bytes: usize,
+    /// Hard ceiling for a single event, pre-compression. Must stay below
+    /// sglake's 16 MiB WAL frame limit: an oversized event is discarded as
+    /// corruption during crash replay, which is the worst failure mode there
+    /// is. `[body_cap]` normally keeps bodies far below this; this is the only
+    /// guard when `body_cap.enabled = false`.
+    #[serde(default = "default_sglake_max_event_bytes")]
+    pub max_event_bytes: usize,
+    /// gzip HEC request bodies.
+    #[serde(default = "default_true")]
+    pub gzip: bool,
+    /// Use HEC indexer acknowledgement to avoid duplicate writes when a
+    /// request fails after the server already committed it.
+    #[serde(default = "default_true")]
+    pub use_ack: bool,
+    #[serde(default = "default_sglake_write_retries")]
+    pub write_retries: u32,
+    #[serde(default = "default_sglake_retry_backoff_ms")]
+    pub retry_backoff_ms: u64,
+    #[serde(default = "default_sglake_request_timeout_secs")]
+    pub request_timeout_secs: u64,
+    #[serde(default = "default_sglake_search_timeout_secs")]
+    pub search_timeout_secs: u64,
+    /// Deep-pagination ceiling. SPL has no offset/cursor, so a page at offset
+    /// N costs `sort N`; past this the backend errors out rather than silently
+    /// truncating.
+    #[serde(default = "default_sglake_max_page_offset")]
+    pub max_page_offset: u64,
+    /// Guard for the session-list scan, which must materialize one row per
+    /// session in the window before it can page.
+    #[serde(default = "default_sglake_max_sessions_scan")]
+    pub max_sessions_scan: u64,
+    /// Concurrency limit for the multi-request read paths (id-chunked point
+    /// lookups, the three-step session list).
+    #[serde(default = "default_sglake_max_concurrent_searches")]
+    pub max_concurrent_searches: usize,
+    /// A trace's `_time` is its start; queries that filter on end time widen
+    /// the search window by this much so bucket pruning stays correct.
+    #[serde(default = "default_sglake_trace_time_skew_hours")]
+    pub trace_time_skew_hours: u32,
+    /// Deduplicate metric rows on read by `row_id`. Off by default: writes are
+    /// at-least-once but duplicates are rare, and `dedup` costs a full sort.
+    /// Turn it on if duplicate metric rows are ever observed.
+    #[serde(default)]
+    pub metrics_dedup: bool,
+    /// Emulate updates to `traces` by appending a new revision and
+    /// deduplicating on read. Off by default because it forces every traces
+    /// read onto a full-window sort, which defeats the pagination design; see
+    /// the crate docs for what stays broken while it is off (proxy pairing).
+    #[serde(default)]
+    pub enable_trace_patching: bool,
+}
+
+impl Default for SglakeConfig {
+    fn default() -> Self {
+        Self {
+            url: default_sglake_url(),
+            hec_token: String::new(),
+            index_prefix: default_sglake_index_prefix(),
+            store_bodies: true,
+            body_retention_days: 0,
+            manage_retention: true,
+            max_body_bytes: default_sglake_max_body_bytes(),
+            max_event_bytes: default_sglake_max_event_bytes(),
+            gzip: true,
+            use_ack: true,
+            write_retries: default_sglake_write_retries(),
+            retry_backoff_ms: default_sglake_retry_backoff_ms(),
+            request_timeout_secs: default_sglake_request_timeout_secs(),
+            search_timeout_secs: default_sglake_search_timeout_secs(),
+            max_page_offset: default_sglake_max_page_offset(),
+            max_sessions_scan: default_sglake_max_sessions_scan(),
+            max_concurrent_searches: default_sglake_max_concurrent_searches(),
+            trace_time_skew_hours: default_sglake_trace_time_skew_hours(),
+            metrics_dedup: false,
+            enable_trace_patching: false,
+        }
+    }
+}
+
+fn default_sglake_url() -> String {
+    "http://127.0.0.1:5959".to_string()
+}
+
+fn default_sglake_index_prefix() -> String {
+    "heron".to_string()
+}
+
+fn default_sglake_max_body_bytes() -> usize {
+    32 * 1024 * 1024
+}
+
+fn default_sglake_max_event_bytes() -> usize {
+    8 * 1024 * 1024
+}
+
+fn default_sglake_write_retries() -> u32 {
+    3
+}
+
+fn default_sglake_retry_backoff_ms() -> u64 {
+    200
+}
+
+fn default_sglake_request_timeout_secs() -> u64 {
+    120
+}
+
+fn default_sglake_search_timeout_secs() -> u64 {
+    120
+}
+
+fn default_sglake_max_page_offset() -> u64 {
+    100_000
+}
+
+fn default_sglake_max_sessions_scan() -> u64 {
+    200_000
+}
+
+fn default_sglake_max_concurrent_searches() -> usize {
+    8
+}
+
+fn default_sglake_trace_time_skew_hours() -> u32 {
+    24
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

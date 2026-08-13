@@ -1,0 +1,350 @@
+//! sglake (sglog) implementation of [`StorageBackend`].
+//!
+//! A third backend alongside `h-storage-duckdb` and `h-storage-clickhouse`,
+//! targeting a Splunk-compatible log platform rather than a SQL database.
+//! Writes go over the HTTP Event Collector; reads are SPL over
+//! `/api/v1/search`. Both are plain HTTP, so — like the ClickHouse backend —
+//! there is no `spawn_blocking`, no writer mutex, and no reader pool.
+//!
+//! Module layout mirrors `h-storage-clickhouse` so the backends diff side by
+//! side, plus two modules with no SQL counterpart:
+//!   * `schema`  — index naming + `init()` (indexes are created on first write)
+//!   * `client`  — `HecClient` (writes) + `SearchClient` (reads)
+//!   * `rows`    — domain structs → HEC events, and search rows → query types
+//!   * `spl`     — quoting, IN-lists, time windows, the pagination template
+//!   * `dims`    — the SPL equivalent of `h_storage::dialect`'s wildcard tiers
+//!   * `calls` / `turns` / `sessions` / `metrics` / `services` / `exchanges` /
+//!     `distincts` / `retention` — one module per entity, same split as the
+//!     other two backends.
+//!
+//! # Durability contract: at-least-once
+//!
+//! [`h_storage::WriteBuffer`] drops a batch when `flush` returns `Err` and
+//! cannot retry (`Vec<T>` is not `Clone`), so every retry lives inside
+//! [`client::HecClient`]. HEC returns 200 only after the events are fsynced,
+//! and a partial-success 400 reports the index of the first bad event, so the
+//! retry loop can advance deterministically instead of resending blindly.
+//! What it cannot do is deduplicate across a sglogd restart — ack ids are
+//! process-local. Duplicates therefore remain possible and surface as repeated
+//! rows; `metrics_dedup` exists for the one case where that would corrupt a
+//! value rather than just look odd.
+//!
+//! # Known divergences from the SQL backends
+//!
+//! * `update_trace_metadata` is a no-op unless `enable_trace_patching` is set:
+//!   emulating updates on an append-only store costs a full-window sort on
+//!   every traces read, which defeats the pagination design. While it is off,
+//!   proxy pairing does not annotate traces (`proxy_role` / `proxy_peer_turn_id`
+//!   stay `None`, and topology loses its `proxy` edges).
+//! * `query_services_topology` bounds the number of turns it will consider;
+//!   past that it returns a truncated graph rather than timing out.
+//! * Bodies live in their own indexes, so `include_bodies = false` genuinely
+//!   avoids fetching them rather than merely projecting them away.
+
+mod calls;
+mod client;
+mod rows;
+mod schema;
+mod spl;
+
+use async_trait::async_trait;
+
+use h_common::config::SglakeConfig;
+use h_common::error::Result;
+use h_llm::model::LlmCall;
+use h_metrics::model::{LlmFinishMetric, LlmMetric};
+use h_protocol::HttpExchange;
+use h_turn::{PairCandidate, Trace};
+
+use h_storage::query::*;
+use h_storage::retention::{RetentionPolicy, RetentionReport};
+use h_storage::StorageBackend;
+
+pub use schema::Indexes;
+
+/// sglake storage backend. Holds the two HTTP clients plus the resolved index
+/// names and behaviour knobs.
+pub struct SglakeBackend {
+    pub(crate) hec: client::HecClient,
+    pub(crate) search: client::SearchClient,
+    pub(crate) ix: Indexes,
+    pub(crate) store_bodies: bool,
+    pub(crate) max_page_offset: u64,
+    #[allow(dead_code)] // wired up in Phase 2 (session list scan guard)
+    pub(crate) max_sessions_scan: u64,
+    #[allow(dead_code)] // wired up in Phase 2 (trace end-time window widening)
+    pub(crate) trace_time_skew_us: i64,
+    #[allow(dead_code)] // wired up in Phase 3 (metrics read dedup)
+    pub(crate) metrics_dedup: bool,
+    #[allow(dead_code)] // wired up in Phase 4 (append-a-revision trace patching)
+    pub(crate) enable_trace_patching: bool,
+    #[allow(dead_code)] // wired up in Phase 4 (per-index retention push)
+    pub(crate) manage_retention: bool,
+}
+
+impl SglakeBackend {
+    /// Build a backend from config. Construction performs no network I/O —
+    /// indexes are materialized lazily on first write, and `init()` only
+    /// probes and reports.
+    pub fn new(config: &SglakeConfig) -> Result<Self> {
+        Ok(Self {
+            hec: client::HecClient::new(config)?,
+            search: client::SearchClient::new(config)?,
+            ix: Indexes::new(&config.index_prefix),
+            store_bodies: config.store_bodies,
+            max_page_offset: config.max_page_offset,
+            max_sessions_scan: config.max_sessions_scan,
+            trace_time_skew_us: config.trace_time_skew_hours as i64 * 3_600_000_000,
+            metrics_dedup: config.metrics_dedup,
+            enable_trace_patching: config.enable_trace_patching,
+            manage_retention: config.manage_retention,
+        })
+    }
+}
+
+/// Phase-gated stub. Read paths that are not implemented yet return an empty
+/// result **and say so** — a silent empty page is indistinguishable from "no
+/// data" and would make a half-built backend look like a working one.
+macro_rules! unimplemented_read {
+    ($method:literal, $empty:expr) => {{
+        tracing::warn!(
+            target: "sglake::unimplemented",
+            method = $method,
+            "sglake backend: read path not implemented yet; returning an empty result"
+        );
+        Ok($empty)
+    }};
+}
+
+/// Same idea for write paths. Returning `Ok` would claim a durable write that
+/// never happened, so these return `Err` — the sink counts it as a flush
+/// error and it shows up in the pipeline health view.
+macro_rules! unimplemented_write {
+    ($entity:literal) => {{
+        Err(h_common::error::AppError::Storage(format!(
+            "sglake backend: {} writes are not implemented yet",
+            $entity
+        )))
+    }};
+}
+
+#[async_trait]
+impl StorageBackend for SglakeBackend {
+    async fn init(&self) -> Result<()> {
+        schema::init(self).await
+    }
+
+    async fn write_spans(&self, calls: Vec<LlmCall>) -> Result<()> {
+        SglakeBackend::write_spans(self, calls).await
+    }
+
+    async fn write_metrics(&self, _metrics: Vec<LlmMetric>) -> Result<()> {
+        unimplemented_write!("llm_metrics")
+    }
+
+    async fn write_finish_metrics(&self, _metrics: Vec<LlmFinishMetric>) -> Result<()> {
+        unimplemented_write!("llm_finish_metrics")
+    }
+
+    async fn write_traces(&self, _turns: Vec<Trace>) -> Result<()> {
+        unimplemented_write!("traces")
+    }
+
+    async fn write_exchanges(&self, _exchanges: Vec<HttpExchange>) -> Result<()> {
+        unimplemented_write!("http_exchanges")
+    }
+
+    // ---- Phase 2: lists + pagination -------------------------------------
+
+    async fn query_spans(&self, _query: &SpansQuery) -> Result<SpansPage> {
+        unimplemented_read!("query_spans", SpansPage { items: Vec::new(), total: 0 })
+    }
+
+    async fn query_traces(&self, _query: &TracesQuery) -> Result<TracesPage> {
+        unimplemented_read!("query_traces", TracesPage { items: Vec::new(), total: 0 })
+    }
+
+    async fn query_http_exchanges(
+        &self,
+        _query: &HttpExchangesQuery,
+    ) -> Result<HttpExchangesPage> {
+        unimplemented_read!(
+            "query_http_exchanges",
+            HttpExchangesPage { items: Vec::new(), total: 0 }
+        )
+    }
+
+    async fn query_sessions(&self, _query: &SessionListQuery) -> Result<SessionsPage> {
+        unimplemented_read!(
+            "query_sessions",
+            SessionsPage { items: Vec::new(), next_cursor: None }
+        )
+    }
+
+    async fn query_session_by_id(
+        &self,
+        _source_id: &str,
+        _session_id: &str,
+    ) -> Result<Option<SessionDetail>> {
+        unimplemented_read!("query_session_by_id", None)
+    }
+
+    async fn query_session_traces(
+        &self,
+        _query: &SessionTracesQuery,
+    ) -> Result<SessionTracesPage> {
+        unimplemented_read!(
+            "query_session_traces",
+            SessionTracesPage { items: Vec::new(), next_cursor: None }
+        )
+    }
+
+    // ---- Phase 1: point lookups ------------------------------------------
+
+    async fn query_span_by_id(&self, _id: &str) -> Result<Option<SpanDetail>> {
+        unimplemented_read!("query_span_by_id", None)
+    }
+
+    async fn query_trace_by_id(&self, _turn_id: &str) -> Result<Option<TraceDetail>> {
+        unimplemented_read!("query_trace_by_id", None)
+    }
+
+    async fn query_trace_spans(
+        &self,
+        _turn_id: &str,
+        _include_bodies: bool,
+    ) -> Result<Vec<TraceSpanItem>> {
+        unimplemented_read!("query_trace_spans", Vec::new())
+    }
+
+    async fn query_spans_by_ids(
+        &self,
+        _span_ids: &[String],
+        _include_bodies: bool,
+    ) -> Result<Vec<TraceSpanItem>> {
+        unimplemented_read!("query_spans_by_ids", Vec::new())
+    }
+
+    async fn query_http_exchange_by_id(&self, _id: &str) -> Result<Option<HttpExchangeDetail>> {
+        unimplemented_read!("query_http_exchange_by_id", None)
+    }
+
+    // ---- Phase 3: aggregates ---------------------------------------------
+
+    async fn query_metrics_timeseries(
+        &self,
+        _query: &MetricsTimeseriesQuery,
+    ) -> Result<Vec<MetricsTimeseriesRow>> {
+        unimplemented_read!("query_metrics_timeseries", Vec::new())
+    }
+
+    async fn query_metrics_summary(
+        &self,
+        _query: &MetricsSummaryQuery,
+    ) -> Result<MetricsSummaryRow> {
+        unimplemented_read!(
+            "query_metrics_summary",
+            MetricsSummaryRow {
+                call_count: 0,
+                error_count: 0,
+                error_4xx_count: 0,
+                error_429_count: 0,
+                error_5xx_count: 0,
+                total_input_tokens: 0,
+                total_output_tokens: 0,
+                ttft_avg: None,
+                e2e_avg: None,
+                tpot_avg: None,
+            }
+        )
+    }
+
+    async fn query_metrics_models(
+        &self,
+        _query: &MetricsModelsQuery,
+    ) -> Result<Vec<MetricsModelRow>> {
+        unimplemented_read!("query_metrics_models", Vec::new())
+    }
+
+    async fn query_finish_reasons(
+        &self,
+        _query: &FinishReasonsQuery,
+    ) -> Result<Vec<FinishReasonTimeseries>> {
+        unimplemented_read!("query_finish_reasons", Vec::new())
+    }
+
+    async fn query_services(&self, _query: &ServicesQuery) -> Result<Vec<ServiceRow>> {
+        unimplemented_read!("query_services", Vec::new())
+    }
+
+    async fn query_services_topology(
+        &self,
+        _query: &ServicesTopologyQuery,
+    ) -> Result<ServicesTopology> {
+        unimplemented_read!(
+            "query_services_topology",
+            ServicesTopology { nodes: Vec::new(), edges: Vec::new() }
+        )
+    }
+
+    async fn query_agent_summary(
+        &self,
+        _query: &AgentSummaryQuery,
+    ) -> Result<Vec<AgentKindSummary>> {
+        unimplemented_read!("query_agent_summary", Vec::new())
+    }
+
+    async fn query_agent_activity(
+        &self,
+        _query: &AgentActivityQuery,
+    ) -> Result<Vec<AgentActivityPoint>> {
+        unimplemented_read!("query_agent_activity", Vec::new())
+    }
+
+    async fn query_distinct_wire_apis(&self) -> Result<Vec<String>> {
+        unimplemented_read!("query_distinct_wire_apis", Vec::new())
+    }
+
+    async fn query_distinct_models(&self) -> Result<Vec<String>> {
+        unimplemented_read!("query_distinct_models", Vec::new())
+    }
+
+    async fn query_distinct_server_ips(&self) -> Result<Vec<String>> {
+        unimplemented_read!("query_distinct_server_ips", Vec::new())
+    }
+
+    async fn query_distinct_agent_kinds(
+        &self,
+        _query: &DistinctAgentKindsQuery,
+    ) -> Result<Vec<String>> {
+        unimplemented_read!("query_distinct_agent_kinds", Vec::new())
+    }
+
+    async fn query_distinct_finish_reasons(&self) -> Result<Vec<DistinctFinishReason>> {
+        unimplemented_read!("query_distinct_finish_reasons", Vec::new())
+    }
+
+    // ---- Phase 4 ---------------------------------------------------------
+
+    async fn apply_retention(&self, _policy: RetentionPolicy) -> Result<RetentionReport> {
+        // Retention in sglake is per-index and bucket-granular, pushed through
+        // its management API rather than executed as DELETEs. Wired up in
+        // Phase 4; until then this is an explicit no-op.
+        Ok(RetentionReport::default())
+    }
+
+    async fn query_pair_candidates(
+        &self,
+        _start_us: i64,
+        _end_us: i64,
+    ) -> Result<Vec<PairCandidate>> {
+        // Paired with `update_trace_metadata` below: without a way to record
+        // the pairing result there is no point discovering candidates.
+        Ok(Vec::new())
+    }
+
+    // `update_trace_metadata` deliberately uses the trait's default no-op —
+    // see the crate docs. `checkpoint_traces_writer` / `reopen_all_connections`
+    // likewise: an HTTP client has no in-process MVCC or index state to
+    // compact or reopen.
+}

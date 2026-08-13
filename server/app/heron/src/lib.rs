@@ -15,6 +15,7 @@ use h_common::error::{AppError, Result};
 use h_storage::StorageBackend;
 use h_storage_clickhouse::ClickHouseBackend;
 use h_storage_duckdb::DuckDbBackend;
+use h_storage_sglake::SglakeBackend;
 
 /// Dispatch on `config.backend` and instantiate the matching storage
 /// backend. Lives in the assembly layer so adding `h-storage-postgres`
@@ -24,6 +25,7 @@ pub fn create_backend(config: &StorageConfig) -> Result<Arc<dyn StorageBackend>>
     match config.backend.as_str() {
         "duckdb" => Ok(Arc::new(DuckDbBackend::open(&config.duckdb.path)?)),
         "clickhouse" => Ok(Arc::new(ClickHouseBackend::new(&config.clickhouse)?)),
+        "sglake" => Ok(Arc::new(SglakeBackend::new(&config.sglake)?)),
         other => Err(AppError::Config(format!(
             "unknown storage backend: {other}"
         ))),
