@@ -224,8 +224,166 @@ pub(crate) fn span_events(call: &LlmCall, store_bodies: bool) -> (SpanEvent, Opt
 }
 
 #[cfg(test)]
+pub(crate) mod fixtures {
+    use super::*;
+    use h_common::agent::{AgentTopology, ToolSurface};
+    use h_common::process::ProcessInfo;
+    use h_llm::model::ApiType;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    /// A fully-populated call. Every `Option` is `Some` and every collection is
+    /// non-empty, so encoding covers the widest event shape.
+    pub(crate) fn full_call() -> LlmCall {
+        LlmCall {
+            source_id: "src-0".into(),
+            id: "019fc053-5fa2-7770-98aa-dd2014c18a51".into(),
+            wire_api: "openai-chat",
+            model: "gpt-4".into(),
+            api_type: ApiType::Chat,
+            request_time: 1_785_638_114_914_200,
+            response_time: Some(1_785_638_115_014_200),
+            complete_time: Some(1_785_638_115_914_200),
+            request_path: "/v1/chat/completions".into(),
+            is_stream: true,
+            request_body: Some(r#"{"model":"gpt-4"}"#.into()),
+            status_code: Some(200),
+            finish_reason: Some("stop".into()),
+            response_body: Some(r#"{"id":"chatcmpl-x"}"#.into()),
+            input_tokens: Some(1234),
+            output_tokens: Some(56),
+            total_tokens: Some(1290),
+            cache_read_input_tokens: Some(7),
+            cache_creation_input_tokens: Some(8),
+            ttft_ms: Some(123.4),
+            e2e_latency_ms: Some(890.1),
+            client_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9)),
+            client_port: 51234,
+            server_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            server_port: 8000,
+            response_id: Some("chatcmpl-x".into()),
+            request_headers: vec![("host".into(), "api.example".into())],
+            response_headers: vec![("server".into(), "uvicorn".into())],
+            is_agent_request: true,
+            tool_surface: Some(ToolSurface::FunctionCall),
+            agent_topology: Some(AgentTopology::SingleAgent),
+            tool_call_count: 2,
+            tool_names: vec!["Bash".into(), "Read".into()],
+            body_bytes_dropped: 0,
+            process: Some(ProcessInfo {
+                pid: 4242,
+                comm: "node".into(),
+                exe: Some("/usr/bin/node".into()),
+            }),
+        }
+    }
+
+    /// The opposite extreme: every `Option` is `None`, every collection empty.
+    /// This is the shape that exposes null-vs-absent bugs.
+    pub(crate) fn minimal_call() -> LlmCall {
+        LlmCall {
+            response_time: None,
+            complete_time: None,
+            request_body: None,
+            status_code: None,
+            finish_reason: None,
+            response_body: None,
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: None,
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: None,
+            ttft_ms: None,
+            e2e_latency_ms: None,
+            response_id: None,
+            request_headers: vec![],
+            response_headers: vec![],
+            tool_surface: None,
+            agent_topology: None,
+            tool_names: vec![],
+            process: None,
+            ..full_call()
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Emit real encoder output for the live round-trip check against sglake.
+    /// Writes only when `SGLAKE_EMIT` names a path, so a normal `cargo test`
+    /// run touches nothing.
+    #[test]
+    fn emit_sample_events() {
+        let Ok(path) = std::env::var("SGLAKE_EMIT") else {
+            return;
+        };
+        let mut out = String::new();
+        for call in [fixtures::full_call(), fixtures::minimal_call()] {
+            let (meta, body) = span_events(&call, true);
+            out.push_str(
+                &Envelope::new(call.request_time, &call.source_id, ST_SPAN, "heron_spans", meta)
+                    .encode()
+                    .unwrap(),
+            );
+            out.push('\n');
+            if let Some(body) = body {
+                out.push_str(
+                    &Envelope::new(call.request_time, &call.source_id, ST_BODY, "heron_bodies", body)
+                        .encode()
+                        .unwrap(),
+                );
+                out.push('\n');
+            }
+        }
+        std::fs::write(&path, out).expect("write sample");
+    }
+
+    /// The minimal call must not emit a single `null`, and must still carry
+    /// every non-optional field.
+    #[test]
+    fn minimal_call_omits_all_optionals() {
+        let (meta, body) = span_events(&fixtures::minimal_call(), true);
+        let s = serde_json::to_string(&meta).unwrap();
+        assert!(!s.contains("null"), "{s}");
+        assert!(!s.contains("status_code"), "{s}");
+        assert!(!s.contains("ttft_ms"), "{s}");
+        // Non-optional fields survive, including the precomputed ones.
+        assert!(s.contains(r#""err_class":"ok""#), "{s}");
+        assert!(s.contains(r#""tool_names_json":"[]""#), "{s}");
+        assert!(s.contains(r#""has_body":false"#), "{s}");
+        // No bodies and no headers ⇒ no body event at all.
+        assert!(body.is_none());
+    }
+
+    #[test]
+    fn full_call_round_trips_every_field() {
+        let call = fixtures::full_call();
+        let (meta, body) = span_events(&call, true);
+        let s = serde_json::to_string(&meta).unwrap();
+        // ts_us is the authoritative timestamp and must stay an integer.
+        assert!(s.contains(r#""ts_us":1785638114914200"#), "{s}");
+        assert!(s.contains(r#""strm":1"#), "{s}");
+        assert!(s.contains(r#""err":0"#), "{s}");
+        assert!(s.contains(r#""tool_surface":"function_call""#), "{s}");
+        assert!(s.contains(r#""agent_topology":"single_agent""#), "{s}");
+        assert!(s.contains(r#""tool_names_json":"[\"Bash\",\"Read\"]""#), "{s}");
+        assert!(s.contains(r#""process_pid":4242"#), "{s}");
+        assert!(s.contains(r#""has_body":true"#), "{s}");
+
+        let b = serde_json::to_string(&body.unwrap()).unwrap();
+        assert!(b.starts_with(r#"{"span_id":"019fc053"#), "{b}");
+        assert!(b.contains("request_headers"), "{b}");
+    }
+
+    /// `store_bodies = false` must suppress the body event entirely, and say so
+    /// on the metadata event so readers skip the second lookup.
+    #[test]
+    fn store_bodies_false_suppresses_body_event() {
+        let (meta, body) = span_events(&fixtures::full_call(), false);
+        assert!(body.is_none());
+        assert!(!meta.has_body);
+    }
 
     #[test]
     fn err_class_covers_every_status_band() {
