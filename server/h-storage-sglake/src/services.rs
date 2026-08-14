@@ -370,7 +370,29 @@ impl SglakeBackend {
             }
         }
 
+        let mut nodes = nodes;
         let edges = assemble_edges(&nodes, entry_counts, proxy_edges);
+
+        // The synthetic `__clients__` super-node, carrying the total of every
+        // client edge. It is not an endpoint, so it cannot come out of the
+        // endpoint aggregation — both SQL backends append it here, and without
+        // it the graph has edges pointing at a node the renderer never
+        // received.
+        let client_total: u64 = edges
+            .iter()
+            .filter(|e| e.kind == "client")
+            .map(|e| e.turn_count)
+            .sum();
+        if client_total > 0 {
+            nodes.push(TopologyNode {
+                server_ip: "__clients__".to_string(),
+                server_port: 0,
+                app: Some("clients".to_string()),
+                models: Vec::new(),
+                call_count: client_total,
+            });
+        }
+
         Ok(ServicesTopology { nodes, edges })
     }
 

@@ -203,7 +203,17 @@ fn glob_body(s: &str) -> String {
 /// These bound bucket pruning, which is the single most effective thing a
 /// query can do here, so they should always be set. `"0"` means unbounded and
 /// forces a full scan.
+///
+/// Negative instants are clamped to the epoch, because sglake's time parser
+/// rejects them outright — `bad time "-86400.000000"` — and a rejected query is
+/// an HTTP 500 on a page that had a perfectly answerable question. The reads
+/// that widen their window backwards to catch a turn that started before it
+/// (see [`crate::SglakeBackend::window`]) produce exactly this when the caller
+/// asks from `start=0`, which the API allows and which pcap replay reaches in
+/// ordinary use. Clamping loses nothing: no event predates 1970, so the epoch
+/// and "unbounded" select the same rows.
 pub(crate) fn epoch_secs(us: i64) -> String {
+    let us = us.max(0);
     format!(
         "{}.{:06}",
         us.div_euclid(1_000_000),
@@ -361,13 +371,25 @@ mod tests {
         );
     }
 
+    /// sglake's time parser rejects a negative instant, so a query whose
+    /// window was widened backwards past 1970 must not produce one — it would
+    /// surface as a 500 on a question that had an answer.
+    #[test]
+    fn epoch_secs_clamps_below_the_epoch() {
+        assert_eq!(epoch_secs(-86_400_000_000), "0.000000");
+        assert_eq!(epoch_secs(-1), "0.000000");
+        assert_eq!(epoch_secs(0), "0.000000");
+        assert!(!epoch_secs(i64::MIN).starts_with('-'));
+    }
+
     #[test]
     fn epoch_secs_keeps_microsecond_precision() {
         assert_eq!(epoch_secs(1_785_638_114_914_200), "1785638114.914200");
         assert_eq!(epoch_secs(1_000_000), "1.000000");
         assert_eq!(epoch_secs(0), "0.000000");
-        // Negative timestamps must not produce a malformed literal.
-        assert_eq!(epoch_secs(-1), "-1.999999");
+        // This used to assert `-1` rendered as the well-formed `"-1.999999"`.
+        // Well-formed was the wrong bar: sglake rejects the value regardless of
+        // how it is spelled. See `epoch_secs_clamps_below_the_epoch`.
     }
 
     /// The window must be cut by row number, not by `| tail` — see

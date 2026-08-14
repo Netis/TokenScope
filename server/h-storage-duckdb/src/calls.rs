@@ -474,6 +474,14 @@ impl DuckDbBackend {
             // Items query
             let offset = (query.page.saturating_sub(1)) as u64 * query.page_size as u64;
             let limit = query.page_size;
+            // The trailing `id` is a deterministic tie-break, and it is not
+            // optional: `LIMIT/OFFSET` paging is only coherent when the sort
+            // order is total. With a repeated sort key the engine may order
+            // tied rows differently between the query for page 1 and the query
+            // for page 2, so one row lands on both pages and another on
+            // neither. Replaying the pcap corpus — where 24 of 26 spans share a
+            // request_time — walked 26 rows across pages of five and saw only
+            // 18 distinct ones. Costs nothing when the sort key is unique.
             let items_sql = format!(
                 "SELECT id, source_id, epoch_ms(request_time), wire_api, model, status_code, is_stream, \
                  finish_reason, ttft_ms, e2e_latency_ms, input_tokens, output_tokens, \
@@ -481,7 +489,7 @@ impl DuckDbBackend {
                  is_agent_request, tool_surface, agent_topology, tool_call_count, tool_names_json, \
                  process_pid, process_comm, process_exe \
                  FROM spans WHERE {where_sql} \
-                 ORDER BY {sort_by} {sort_order} \
+                 ORDER BY {sort_by} {sort_order}, id ASC \
                  LIMIT {limit} OFFSET {offset}"
             );
 
@@ -741,11 +749,11 @@ impl DuckDbBackend {
 #[cfg(test)]
 mod tests {
     use crate::DuckDbBackend;
-    use std::net::IpAddr;
     use h_llm::model::{ApiType, LlmCall};
     use h_llm::wire_apis as wa;
     use h_storage::query::*;
     use h_storage::StorageBackend;
+    use std::net::IpAddr;
 
     fn in_memory() -> DuckDbBackend {
         DuckDbBackend::open(":memory:").unwrap()
@@ -913,6 +921,101 @@ mod tests {
         assert_eq!(page.items[0].status_code, Some(200));
         assert_eq!(page.items[0].input_tokens, Some(100));
         assert_eq!(page.items[0].output_tokens, Some(50));
+    }
+
+    /// Walking every page must visit every row exactly once, even when the
+    /// sort key is the same for all of them.
+    ///
+    /// `LIMIT/OFFSET` runs one query per page, so the paging is only coherent
+    /// if the sort order is total; with tied rows the engine may order them
+    /// differently between pages, putting one row on two pages and another on
+    /// none. That is not hypothetical — replaying the pcap corpus through the
+    /// pipeline, where 24 of 26 spans share a request_time, walked 26 rows
+    /// across pages of five and returned 18 distinct ones. Adding `id` to the
+    /// ORDER BY took it to 26.
+    ///
+    /// **What this test does not do is reproduce that.** Driving the backend
+    /// directly — in-memory or file-backed, 25 rows or 500, one write or many
+    /// — returns insertion order every time, with or without the tie-break.
+    /// Whatever perturbs the scan order lives in the running pipeline, not in
+    /// a query executed on a quiet database. So read this as a floor (paging
+    /// returns every row once under these conditions) and not as the guard on
+    /// the tie-break; that guard is the cross-backend corpus replay, which
+    /// checks the same property against a live pipeline and does fail without
+    /// the fix.
+    #[tokio::test]
+    async fn paging_visits_every_row_once_when_every_timestamp_is_identical() {
+        // File-backed, not `:memory:`. The reordering this guards against
+        // comes from the plan the engine picks for a persisted table; an
+        // in-memory table of the same size happens to come back in insertion
+        // order every time, so a `:memory:` version of this test passes with
+        // or without the tie-break and proves nothing.
+        let dir = std::env::temp_dir().join(format!("heron-paging-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.duckdb");
+        let backend = DuckDbBackend::open(path.to_str().unwrap()).unwrap();
+        backend.init().await.unwrap();
+
+        let n = 500usize;
+        let calls: Vec<LlmCall> = (0..n)
+            .map(|i| {
+                let mut c = sample_call();
+                // Distinct ids, one shared timestamp: the worst case for a
+                // non-total order, and the shape real capture produces.
+                c.id = format!("id-{i:04}");
+                c
+            })
+            .collect();
+        let at = calls[0].request_time;
+        // In batches, the way the storage sink writes them: each flush is its
+        // own appender run, and the row groups that produces are what makes
+        // the scan order vary between one query and the next.
+        for chunk in calls.chunks(7) {
+            backend.write_spans(chunk.to_vec()).await.unwrap();
+        }
+
+        let page_of = |page: u32| SpansQuery {
+            time_range: TimeRange {
+                start_us: at - 1,
+                end_us: at + 1_000_000,
+            },
+            filter: DimensionFilter::default(),
+            status_codes: vec![],
+            finish_reasons: vec![],
+            client_ips: vec![],
+            server_ports: vec![],
+            request_path_contains: None,
+            is_stream: None,
+            sort_by: "request_time".to_string(),
+            sort_order: "DESC".to_string(),
+            page,
+            page_size: 4,
+        };
+
+        let mut seen = Vec::new();
+        for page in 1..=125u32 {
+            let p = backend.query_spans(&page_of(page)).await.unwrap();
+            assert_eq!(p.total, n as u64);
+            seen.extend(p.items.into_iter().map(|i| i.id));
+        }
+        let distinct: std::collections::BTreeSet<&String> = seen.iter().collect();
+        assert_eq!(
+            seen.len(),
+            n,
+            "paging visited {} rows, expected {n}",
+            seen.len()
+        );
+        assert_eq!(
+            distinct.len(),
+            n,
+            "paging returned {} distinct rows out of {} visited — rows are \
+             being duplicated across pages and others lost",
+            distinct.len(),
+            seen.len()
+        );
+        drop(backend);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

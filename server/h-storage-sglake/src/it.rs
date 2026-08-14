@@ -1295,13 +1295,34 @@ async fn services_aggregate_endpoints_and_build_a_graph() {
         (!g.edges.is_empty()).then_some(g)
     })
     .await;
-    assert_eq!(topo.nodes.len(), 1);
-    assert_eq!(topo.nodes[0].call_count, 6);
     // The client IP hosts no known service, so it is an external client.
     assert_eq!(topo.edges.len(), 1);
     assert_eq!(topo.edges[0].kind, "client");
     assert_eq!(topo.edges[0].to_ip, "10.0.0.1");
     assert_eq!(topo.edges[0].to_port, 8000);
+
+    // Two nodes: the endpoint, and the synthetic super-node the client edge
+    // originates from. An earlier version of this test asserted one node and
+    // so locked in a graph whose edge pointed at a node that was never sent —
+    // it took a cross-backend replay to notice.
+    let endpoint = topo
+        .nodes
+        .iter()
+        .find(|n| n.server_ip == "10.0.0.1")
+        .expect("the endpoint node");
+    assert_eq!(endpoint.call_count, 6);
+    let clients = topo
+        .nodes
+        .iter()
+        .find(|n| n.server_ip == "__clients__")
+        .expect("the synthetic __clients__ node");
+    assert_eq!(clients.server_port, 0);
+    assert_eq!(clients.app.as_deref(), Some("clients"));
+    assert_eq!(
+        clients.call_count, topo.edges[0].turn_count,
+        "the super-node's total is the sum of the client edges"
+    );
+    assert_eq!(topo.nodes.len(), 2);
 
     assert!(backend
         .query_services(&ServicesQuery {
@@ -1422,6 +1443,18 @@ async fn distincts_and_agent_rollups() {
         vec!["claude-cli".to_string(), "codex-cli".to_string()]
     );
 
+    // The summary's contract comes from the SQL backends: `last_seen_ms` is
+    // the latest turn *start*, and rows come back busiest-first.
+    assert_eq!(
+        summary[0].last_seen_ms,
+        (base + 2_000_000) / 1000,
+        "last_seen_ms is max(start), not max(end)"
+    );
+    assert!(
+        summary[0].turn_count >= summary[1].turn_count,
+        "summary must be ordered by turn_count DESC: {summary:?}"
+    );
+
     let activity = backend
         .query_agent_activity(&AgentActivityQuery {
             time_range: tr(base),
@@ -1433,6 +1466,24 @@ async fn distincts_and_agent_rollups() {
     let total: u64 = activity.iter().map(|p| p.turn_count).sum();
     assert_eq!(total, 3);
     assert!(activity.iter().all(|p| p.timestamp_ms > 0));
+
+    // No hint: the bucket has to be derived the same way the SQL backends
+    // derive it, or the same request lands on a different time grid depending
+    // on which backend answered. `tr()` spans 120 s, so the target rounds up
+    // to the 60 s floor.
+    let auto = backend
+        .query_agent_activity(&AgentActivityQuery {
+            time_range: tr(base),
+            bucket_seconds: None,
+        })
+        .await
+        .unwrap();
+    let total: u64 = auto.iter().map(|p| p.turn_count).sum();
+    assert_eq!(total, 3, "the default bucket must not drop turns");
+    assert!(
+        auto.iter().all(|p| p.timestamp_ms % 60_000 == 0),
+        "a 120 s window must bucket at 60 s, not the old hardcoded hour: {auto:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------

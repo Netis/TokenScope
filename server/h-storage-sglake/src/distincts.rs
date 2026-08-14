@@ -135,12 +135,16 @@ impl SglakeBackend {
         query: &AgentSummaryQuery,
     ) -> Result<Vec<AgentKindSummary>> {
         let s = Search::new(&self.ix.traces, ST_TRACE);
+        // `last_seen_ms` is the latest turn *start*, not the latest end — both
+        // SQL backends read `max(start_time)`, and this is a cross-backend
+        // contract rather than a judgement call. Ordering is likewise theirs:
+        // busiest agent kind first.
         let spl_q = format!(
             "{} | stats count as turn_count, sum(total_input_tokens) as total_input_tokens, \
                sum(total_output_tokens) as total_output_tokens, \
-               avg(duration_ms) as avg_duration_ms, max(end_us) as last_us \
+               avg(duration_ms) as avg_duration_ms, max(ts_us) as last_us \
              by agent_kind \
-             | sort 0 +str(agent_kind) \
+             | sort 0 -num(turn_count), +str(agent_kind) \
              | table agent_kind, turn_count, total_input_tokens, total_output_tokens, \
                avg_duration_ms, last_us",
             s.build()
@@ -174,7 +178,25 @@ impl SglakeBackend {
         &self,
         query: &AgentActivityQuery,
     ) -> Result<Vec<AgentActivityPoint>> {
-        let bucket = query.bucket_seconds.unwrap_or(3600).max(1);
+        // With no explicit hint, pick a bucket that lands the chart at roughly
+        // 60-180 points and snaps to a width whose tick labels read cleanly.
+        // Copied from the SQL backends rather than reinvented: a different
+        // default here would put the same request on a different time grid
+        // depending on which backend answered it.
+        let window_secs =
+            ((query.time_range.end_us - query.time_range.start_us) / 1_000_000).max(60);
+        let bucket = query
+            .bucket_seconds
+            .unwrap_or_else(|| {
+                let target = (window_secs / 120).max(60) as u32;
+                for &nice in &[60u32, 300, 600, 1800, 3600, 7200, 14400, 86400] {
+                    if target <= nice {
+                        return nice;
+                    }
+                }
+                86400
+            })
+            .max(1);
         let s = Search::new(&self.ix.traces, ST_TRACE);
         // Bucket on `_time` rather than `ts_us`: `bin` works on the event
         // timestamp, and bucket starts are whole seconds, so the f64 precision

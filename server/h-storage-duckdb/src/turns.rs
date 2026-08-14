@@ -329,7 +329,7 @@ impl DuckDbBackend {
                  client_ip, server_ip, metadata, \
                  tool_surfaces_json, tool_call_total, agent_topology, suspicious_skills_json \
                  FROM traces WHERE {where_sql} \
-                 ORDER BY {sort_by} {sort_order} \
+                 ORDER BY {sort_by} {sort_order}, turn_id ASC \
                  LIMIT {limit} OFFSET {offset}"
             );
 
@@ -782,12 +782,12 @@ impl DuckDbBackend {
 #[cfg(test)]
 mod tests {
     use crate::DuckDbBackend;
-    use std::net::IpAddr;
     use h_llm::model::{ApiType, LlmCall};
     use h_llm::wire_apis as wa;
     use h_storage::query::*;
     use h_storage::StorageBackend;
     use h_turn::{Trace, TraceStatus};
+    use std::net::IpAddr;
 
     fn sample_turn(
         turn_id: &str,
