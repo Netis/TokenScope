@@ -139,8 +139,18 @@ fi
 
 sudo install -m0755 "$NEW" "$BIN"
 
+# A binary that refuses to start crash-loops under `Restart=on-failure` for the
+# length of the health gate, which can trip systemd's start-rate limit and leave
+# the unit `failed`. From there `systemctl restart` answers "start request
+# repeated too quickly" — the rollback would fail exactly when it is needed.
+# Clear the counter before every restart so it cannot.
+restart_service() {
+  sudo systemctl reset-failed "$SERVICE" >/dev/null 2>&1 || true
+  sudo systemctl restart "$SERVICE"
+}
+
 echo "==> restarting $SERVICE"
-sudo systemctl restart "$SERVICE"
+restart_service
 
 # ------------------------------------------------------------------- the gate
 gate() {
@@ -179,7 +189,7 @@ echo "::error::post-deploy gate FAILED" >&2
 if [ "$HAVE_BAK" = 1 ]; then
   echo "==> rolling back to the previous binary + restarting"
   sudo cp -fp "$BAK" "$BIN"
-  sudo systemctl restart "$SERVICE"
+  restart_service
   sleep 5
   rb="$(curl -s -m 5 "http://127.0.0.1:${PORT}/api/health" 2>/dev/null | python3 -c 'import json,sys
 try: print(json.load(sys.stdin)["data"]["status"])
