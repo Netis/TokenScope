@@ -1434,3 +1434,522 @@ async fn distincts_and_agent_rollups() {
     assert_eq!(total, 3);
     assert!(activity.iter().all(|p| p.timestamp_ms > 0));
 }
+
+// ---------------------------------------------------------------------------
+// Phase 4: retention, acks, metrics dedup
+// ---------------------------------------------------------------------------
+
+/// Retention has to reach sglake as a real per-index TTL, or the whole design
+/// is a no-op that logs cheerfully. This asserts it round-trips: push the
+/// policy, then read the value back out of sglake's own index catalogue.
+///
+/// Skips — rather than fails — when the management API is not mounted, since
+/// that depends on how the sglogd under test was started, not on this code.
+#[tokio::test]
+async fn retention_reaches_sglake_as_a_per_index_ttl() {
+    let backend = require_backend!();
+    if backend.management.list_indexes().await.is_err() {
+        eprintln!("skip: sglogd has no index management API (needs --splunk-web-dir)");
+        return;
+    }
+
+    let base = 1_760_000_000_000_000i64;
+    let mut call = fixtures::full_call();
+    call.id = uuid::Uuid::now_v7().to_string();
+    call.request_time = base;
+    backend.write_spans(vec![call]).await.unwrap();
+    backend
+        .write_metrics(vec![fixtures::sample_metric()])
+        .await
+        .unwrap();
+
+    // The index has to exist before it can be configured, and it exists only
+    // once a write has landed in it.
+    eventually("indexes to appear in the catalogue", || async {
+        let names: Vec<String> = backend
+            .management
+            .list_indexes()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|i| i.name)
+            .collect();
+        (names.contains(&backend.ix.spans) && names.contains(&backend.ix.bodies)).then_some(())
+    })
+    .await;
+
+    let now = std::time::SystemTime::now();
+    let policy = h_storage::retention::RetentionPolicy {
+        spans_before: Some(now - Duration::from_secs(7 * 86_400)),
+        traces_before: Some(now - Duration::from_secs(30 * 86_400)),
+        http_exchanges_before: None,
+        metrics_before: vec![("10s".into(), now - Duration::from_secs(86_400))],
+    };
+    let report = backend.apply_retention(policy).await.unwrap();
+    assert_eq!(
+        report.total(),
+        0,
+        "sglake declares TTLs rather than deleting rows, so it must not \
+         invent a deletion count"
+    );
+
+    let by_name: std::collections::HashMap<String, Option<i64>> = backend
+        .management
+        .list_indexes()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|i| (i.name, i.frozen_after_secs))
+        .collect();
+
+    assert_eq!(by_name.get(&backend.ix.spans), Some(&Some(7 * 86_400)));
+    // Bodies inherit their parent's schedule when not configured separately.
+    assert_eq!(by_name.get(&backend.ix.bodies), Some(&Some(7 * 86_400)));
+    let m10s = backend.ix.metrics_for("10s").unwrap().to_string();
+    assert_eq!(by_name.get(&m10s), Some(&Some(86_400)));
+
+    // No cutoff must mean "keep", not "some default appeared".
+    assert!(
+        !by_name.contains_key(&backend.ix.http) || by_name[&backend.ix.http].is_none(),
+        "http_exchanges had no cutoff and must not have been given one"
+    );
+
+    // Re-applying an unchanged policy is a normal occurrence — the retention
+    // loop runs on a timer — and must stay correct rather than drift.
+    let policy = h_storage::retention::RetentionPolicy {
+        spans_before: Some(now - Duration::from_secs(7 * 86_400)),
+        ..Default::default()
+    };
+    backend.apply_retention(policy).await.unwrap();
+    let again = backend.management.list_indexes().await.unwrap();
+    let spans = again.iter().find(|i| i.name == backend.ix.spans).unwrap();
+    assert_eq!(spans.frozen_after_secs, Some(7 * 86_400));
+}
+
+/// `manage_retention = false` hands retention to whoever runs sglogd. It has
+/// to mean *nothing is sent*, not "sent, but quietly".
+#[tokio::test]
+async fn manage_retention_off_sends_nothing() {
+    let Ok(url) = std::env::var("SGLAKE_TEST_URL") else {
+        eprintln!("skip: SGLAKE_TEST_URL unset");
+        return;
+    };
+    let nonce = uuid::Uuid::now_v7().simple().to_string();
+    let cfg = SglakeConfig {
+        url,
+        hec_token: std::env::var("SGLAKE_TEST_TOKEN").unwrap_or_default(),
+        index_prefix: format!("itnoret{}", &nonce[..12]),
+        manage_retention: false,
+        ..Default::default()
+    };
+    let backend = SglakeBackend::new(&cfg).unwrap();
+    backend.init().await.unwrap();
+    if backend.management.list_indexes().await.is_err() {
+        eprintln!("skip: sglogd has no index management API");
+        return;
+    }
+
+    let mut call = fixtures::full_call();
+    call.id = uuid::Uuid::now_v7().to_string();
+    backend.write_spans(vec![call]).await.unwrap();
+    eventually("spans index to appear", || async {
+        backend
+            .management
+            .list_indexes()
+            .await
+            .unwrap()
+            .iter()
+            .any(|i| i.name == backend.ix.spans)
+            .then_some(())
+    })
+    .await;
+
+    // Compare against a baseline rather than against `None`: the catalogue
+    // reports the *effective* TTL, so a sglogd started with a server-wide
+    // --retention-days shows a value here that nobody pushed. "Sends nothing"
+    // is therefore "nothing changed", not "nothing is set".
+    let before = backend
+        .management
+        .list_indexes()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|i| i.name == backend.ix.spans)
+        .unwrap()
+        .frozen_after_secs;
+
+    let now = std::time::SystemTime::now();
+    backend
+        .apply_retention(h_storage::retention::RetentionPolicy {
+            spans_before: Some(now - Duration::from_secs(7 * 86_400)),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let after = backend
+        .management
+        .list_indexes()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|i| i.name == backend.ix.spans)
+        .unwrap()
+        .frozen_after_secs;
+    assert_eq!(
+        after, before,
+        "retention was pushed despite manage_retention = false"
+    );
+    assert_ne!(
+        after,
+        Some(7 * 86_400),
+        "the policy's TTL reached sglake despite manage_retention = false"
+    );
+}
+
+/// Acks are on by default, so every write in this suite already exercises the
+/// channel header. What this adds is the part the other tests cannot show:
+/// that the header does not disturb ingest, and that the ack endpoint answers
+/// the question the retry path asks it.
+#[tokio::test]
+async fn writes_carry_an_ack_channel_and_the_answer_is_usable() {
+    let backend = require_backend!();
+    let base = 1_760_000_100_000_000i64;
+    let mut call = fixtures::full_call();
+    call.id = uuid::Uuid::now_v7().to_string();
+    call.request_time = base;
+    backend.write_spans(vec![call.clone()]).await.unwrap();
+
+    let got = eventually("span written with an ack channel", || async {
+        backend.query_span_by_id(&call.id).await.unwrap()
+    })
+    .await;
+    assert_eq!(got.id, call.id);
+
+    // An unused channel must answer "not committed" — that is the negative
+    // half of the signal, and without it a resend would be suppressed for a
+    // batch that never landed.
+    let unused = uuid::Uuid::now_v7().to_string();
+    assert_eq!(
+        backend.hec.ack_committed(&unused).await,
+        Some(false),
+        "a channel that never carried a request must not report a commit"
+    );
+}
+
+/// The read-side half of the `row_id` scheme. Writing the same metric batch
+/// twice is exactly what an at-least-once resend does; with dedup on, the sums
+/// must not double.
+#[tokio::test]
+async fn metrics_dedup_collapses_a_duplicated_write() {
+    let Ok(url) = std::env::var("SGLAKE_TEST_URL") else {
+        eprintln!("skip: SGLAKE_TEST_URL unset");
+        return;
+    };
+    let token = std::env::var("SGLAKE_TEST_TOKEN").unwrap_or_default();
+    let nonce = uuid::Uuid::now_v7().simple().to_string();
+    let prefix = format!("itdedup{}", &nonce[..12]);
+
+    let plain = SglakeBackend::new(&SglakeConfig {
+        url: url.clone(),
+        hec_token: token.clone(),
+        index_prefix: prefix.clone(),
+        ..Default::default()
+    })
+    .unwrap();
+    plain.init().await.unwrap();
+
+    // The summary query reads the grand-total rollup tier, so the row has to
+    // be one — a detail row would simply not be selected, and the test would
+    // fail waiting for data that was never in scope.
+    let mut m = fixtures::sample_metric();
+    m.wire_api = "*".into();
+    m.model = "*".into();
+    m.server_ip = "*".into();
+    m.tool_surface = None;
+    let base = m.timestamp_us;
+    plain.write_metrics(vec![m.clone()]).await.unwrap();
+
+    let range = TimeRange {
+        start_us: base - 60_000_000,
+        end_us: base + 60_000_000,
+    };
+
+    async fn summary_of(b: &SglakeBackend, range: &TimeRange) -> MetricsSummaryRow {
+        b.query_metrics_summary(&MetricsSummaryQuery {
+            time_range: range.clone(),
+            filter: DimensionFilter::default(),
+        })
+        .await
+        .unwrap()
+    }
+
+    let once = eventually("first metric row", || async {
+        let s = summary_of(&plain, &range).await;
+        (s.call_count > 0).then_some(s)
+    })
+    .await;
+
+    // Now duplicate it the way a resend would: the same event bytes, including
+    // the same `row_id`, posted a second time.
+    let dup = crate::rows::metric_event(&m, "dup-row-id-fixed".into());
+    let ix = plain.ix.metrics_for(m.granularity).unwrap().to_string();
+    for _ in 0..2 {
+        let ev = crate::rows::Envelope::new(
+            m.timestamp_us,
+            &m.source_id,
+            crate::rows::ST_METRIC,
+            &ix,
+            &dup,
+        )
+        .encode()
+        .unwrap();
+        plain.hec.send(vec![ev]).await.unwrap();
+    }
+
+    let doubled = eventually("the duplicated rows", || async {
+        let s = summary_of(&plain, &range).await;
+        (s.call_count > once.call_count).then_some(s)
+    })
+    .await;
+    assert_eq!(
+        doubled.call_count,
+        once.call_count * 3,
+        "precondition: without dedup, duplicates really do inflate the sum"
+    );
+
+    let deduped = SglakeBackend::new(&SglakeConfig {
+        url,
+        hec_token: token,
+        index_prefix: prefix,
+        metrics_dedup: true,
+        ..Default::default()
+    })
+    .unwrap();
+    let s = summary_of(&deduped, &range).await;
+    assert_eq!(
+        s.call_count,
+        once.call_count * 2,
+        "dedup must collapse the two identical row_ids to one, leaving the \
+         original row and one copy of the duplicate"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Fault injection: sglogd goes away mid-write
+// ---------------------------------------------------------------------------
+//
+// The DuckDB backend has a `--features fault-injection` suite that kills the
+// database underneath a write and asserts the write either commits or returns
+// `Err` — never silently vanishes. Nothing there transfers to an HTTP client,
+// so this is its counterpart: it starts a private sglogd, kills it by its exact
+// pid mid-stream, and checks what Heron does about it.
+//
+// Opt-in through `SGLAKE_SGLOGD_BIN`, because unlike the rest of the suite it
+// spawns and kills processes. `SGLAKE_SPLUNK_WEB_DIR` additionally enables the
+// management API so the retention degradation can be checked too.
+
+/// A sglogd this test owns, on its own port and data directory.
+struct OwnedSglogd {
+    bin: String,
+    web_dir: Option<String>,
+    dir: std::path::PathBuf,
+    port: u16,
+    child: Option<std::process::Child>,
+}
+
+impl OwnedSglogd {
+    fn spawn(&mut self) {
+        let mut cmd = std::process::Command::new(&self.bin);
+        cmd.arg("--data-dir")
+            .arg(&self.dir)
+            .arg("--listen")
+            .arg(format!("127.0.0.1:{}", self.port))
+            .arg("--hec-token")
+            .arg("heron-fault")
+            .arg("--no-self-trace")
+            .arg("--max-hot-raw-mib")
+            .arg("2048")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if let Some(w) = &self.web_dir {
+            cmd.arg("--splunk-web-dir").arg(w);
+        }
+        self.child = Some(cmd.spawn().expect("spawn sglogd"));
+    }
+
+    fn url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+
+    async fn wait_ready(&self) {
+        let probe = format!("{}/api/v1/indexes", self.url());
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while Instant::now() < deadline {
+            if reqwest_get_ok(&probe).await {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        panic!("sglogd never became ready on port {}", self.port);
+    }
+
+    async fn wait_down(&self) {
+        let probe = format!("{}/api/v1/indexes", self.url());
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            if !reqwest_get_ok(&probe).await {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("sglogd on port {} refused to go down", self.port);
+    }
+
+    /// SIGKILL, by this child's exact pid and nothing else. Abrupt on purpose:
+    /// a clean shutdown would flush, and the point is to test what survives
+    /// when nothing gets to flush.
+    async fn kill(&mut self) {
+        if let Some(mut c) = self.child.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+        self.wait_down().await;
+    }
+}
+
+impl Drop for OwnedSglogd {
+    fn drop(&mut self) {
+        if let Some(mut c) = self.child.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+async fn reqwest_get_ok(url: &str) -> bool {
+    matches!(reqwest::Client::new()
+        .get(url)
+        .timeout(Duration::from_secs(1))
+        .send()
+        .await, Ok(r) if r.status().is_success())
+}
+
+fn span_batch(base_us: i64, tag: &str, n: usize) -> Vec<h_llm::model::LlmCall> {
+    (0..n)
+        .map(|i| {
+            let mut c = fixtures::full_call();
+            c.id = format!("{tag}-{i}-{}", uuid::Uuid::now_v7());
+            c.request_time = base_us + i as i64 * 1_000;
+            c
+        })
+        .collect()
+}
+
+/// Killing sglogd mid-stream must produce an error, not a panic and not a
+/// silent drop — and writes must resume once it is back, with everything that
+/// was acknowledged before the kill still there.
+#[tokio::test]
+async fn a_write_against_a_dead_sglogd_errors_and_recovers() {
+    let Ok(bin) = std::env::var("SGLAKE_SGLOGD_BIN") else {
+        eprintln!("skip: SGLAKE_SGLOGD_BIN unset");
+        return;
+    };
+    let nonce = uuid::Uuid::now_v7().simple().to_string();
+    let mut sg = OwnedSglogd {
+        bin,
+        web_dir: std::env::var("SGLAKE_SPLUNK_WEB_DIR").ok(),
+        dir: std::env::temp_dir().join(format!("sglake-fault-{}", &nonce[..12])),
+        // A port nobody else in this suite uses. Derived from the nonce so
+        // two concurrent runs do not collide.
+        port: 20000 + (u16::from_str_radix(&nonce[..4], 16).unwrap_or(0) % 20000),
+        child: None,
+    };
+    std::fs::create_dir_all(&sg.dir).unwrap();
+    sg.spawn();
+    sg.wait_ready().await;
+
+    let cfg = SglakeConfig {
+        url: sg.url(),
+        hec_token: "heron-fault".into(),
+        index_prefix: format!("flt{}", &nonce[..12]),
+        // Fail fast: the point is to observe the error, not to sit through a
+        // full retry schedule.
+        write_retries: 1,
+        retry_backoff_ms: 50,
+        request_timeout_secs: 5,
+        search_timeout_secs: 10,
+        ..Default::default()
+    };
+    let backend = SglakeBackend::new(&cfg).unwrap();
+    backend.init().await.unwrap();
+
+    let base = 1_770_000_000_000_000i64;
+    let before = span_batch(base, "before", 20);
+    let before_ids: Vec<String> = before.iter().map(|c| c.id.clone()).collect();
+    backend.write_spans(before).await.expect("healthy write");
+
+    eventually("the pre-kill batch", || async {
+        (backend
+            .query_span_by_id(before_ids.last().unwrap())
+            .await
+            .unwrap()
+            .is_some())
+        .then_some(())
+    })
+    .await;
+
+    sg.kill().await;
+
+    // The contract WriteBuffer depends on: a flush that did not land returns
+    // `Err`. Returning `Ok` here would make the buffer discard the batch as
+    // committed, which is exactly the silent-loss failure this guards.
+    let err = backend
+        .write_spans(span_batch(base + 1_000_000, "during", 5))
+        .await
+        .expect_err("a write to a dead server must not report success");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("sglake"),
+        "the error must name the backend that failed: {msg}"
+    );
+
+    // Reads fail loudly too, rather than answering "no results".
+    assert!(
+        backend.query_span_by_id(&before_ids[0]).await.is_err(),
+        "a read against a dead server must error, not report an empty result \
+         — an empty result is indistinguishable from real absence"
+    );
+
+    // Retention degrades to a no-op rather than propagating an error and
+    // taking down the shared retention loop with it.
+    let now = std::time::SystemTime::now();
+    backend
+        .apply_retention(h_storage::retention::RetentionPolicy {
+            spans_before: Some(now - Duration::from_secs(7 * 86_400)),
+            ..Default::default()
+        })
+        .await
+        .expect("retention must degrade, not fail the sweep");
+
+    sg.spawn();
+    sg.wait_ready().await;
+
+    let after = span_batch(base + 2_000_000, "after", 20);
+    let after_ids: Vec<String> = after.iter().map(|c| c.id.clone()).collect();
+    backend
+        .write_spans(after)
+        .await
+        .expect("write after recovery");
+
+    // Everything acknowledged before the SIGKILL is still on disk: HEC returns
+    // 200 only after the WAL fsync, so an abrupt kill cannot take it back.
+    let backend = &backend;
+    for id in before_ids.iter().chain(after_ids.iter()) {
+        eventually("a span to survive the restart", || async move {
+            backend.query_span_by_id(id).await.unwrap().map(|_| ())
+        })
+        .await;
+    }
+}

@@ -1235,7 +1235,13 @@ pub enum ConfigIssue {
     /// Body indexes are set to outlive the span metadata that points at them,
     /// leaving bodies nothing can reach. `0` means "inherit", which is always
     /// consistent. Only emitted when `storage.backend == "sglake"`.
-    SglakeBodyRetentionExceedsSpans { body_days: u32, spans_days: u32 },
+    SglakeBodyRetentionExceedsParent {
+        body_days: u32,
+        /// Which entity's retention the bodies would outlive — `spans` for the
+        /// LLM-call bodies index, `http_exchanges` for the HTTP one.
+        parent: String,
+        parent_days: u32,
+    },
 }
 
 impl ConfigIssue {
@@ -1250,7 +1256,7 @@ impl ConfigIssue {
             | Self::PcapDumpRetentionNoRules { .. }
             // Orphaned bodies waste space but break nothing: the metadata
             // rows that would reference them are already gone.
-            | Self::SglakeBodyRetentionExceedsSpans { .. } => IssueSeverity::Warn,
+            | Self::SglakeBodyRetentionExceedsParent { .. } => IssueSeverity::Warn,
             Self::DuplicatePipelineName(_)
             | Self::DuplicateSourceId { .. }
             | Self::StoragePathParentUnwritable { .. }
@@ -1359,16 +1365,18 @@ impl std::fmt::Display for ConfigIssue {
                  full-size events would be dropped before being sent. Raise \
                  max_event_bytes or lower [body_cap]."
             ),
-            Self::SglakeBodyRetentionExceedsSpans {
+            Self::SglakeBodyRetentionExceedsParent {
                 body_days,
-                spans_days,
+                parent,
+                parent_days,
             } => write!(
                 f,
                 "storage.sglake.body_retention_days ({body_days}d) outlives \
-                 storage.retention.spans ({spans_days}d): bodies will survive \
-                 the span metadata that points at them and become \
-                 unreachable. Set body_retention_days <= spans (or 0 to \
-                 inherit it)."
+                 storage.retention.{parent} ({parent_days}d): bodies will \
+                 survive the metadata that points at them and become \
+                 unreachable, since every read finds a body through its \
+                 parent's id. Set body_retention_days <= {parent} (or 0 to \
+                 inherit each body index's own parent)."
             ),
         }
     }
@@ -1541,12 +1549,21 @@ impl AppConfig {
                     });
                 }
             }
-            let spans_days = self.storage.retention.spans;
-            if spans_days > 0 && sg.body_retention_days > spans_days {
-                issues.push(ConfigIssue::SglakeBodyRetentionExceedsSpans {
-                    body_days: sg.body_retention_days,
-                    spans_days,
-                });
+            // Bodies live in their own indexes and, when given an explicit
+            // retention, use it for both of them. Outliving *either* parent
+            // strands bodies that nothing can reach — a body is only ever
+            // found through its parent's id.
+            for (parent, days) in [
+                ("spans", self.storage.retention.spans),
+                ("http_exchanges", self.storage.retention.http_exchanges),
+            ] {
+                if days > 0 && sg.body_retention_days > days {
+                    issues.push(ConfigIssue::SglakeBodyRetentionExceedsParent {
+                        body_days: sg.body_retention_days,
+                        parent: parent.to_string(),
+                        parent_days: days,
+                    });
+                }
             }
         }
 
@@ -2282,14 +2299,26 @@ mod phase2_tests {
             [storage.retention]
             spans = 7
             traces = 7
+            http_exchanges = 3
             "#,
         );
-        let issue = cfg
+        let issues: Vec<_> = cfg
             .validate()
             .into_iter()
-            .find(|i| matches!(i, ConfigIssue::SglakeBodyRetentionExceedsSpans { .. }))
-            .expect("expected the body-retention issue");
-        assert_eq!(issue.severity(), IssueSeverity::Warn);
+            .filter(|i| matches!(i, ConfigIssue::SglakeBodyRetentionExceedsParent { .. }))
+            .collect();
+        // Bodies sit in two indexes with two different parents; outliving
+        // either one strands bodies, so both have to be reported.
+        assert_eq!(issues.len(), 2, "{issues:?}");
+        assert!(issues.iter().all(|i| i.severity() == IssueSeverity::Warn));
+        let named: Vec<&str> = issues
+            .iter()
+            .map(|i| match i {
+                ConfigIssue::SglakeBodyRetentionExceedsParent { parent, .. } => parent.as_str(),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(named, vec!["spans", "http_exchanges"]);
 
         // 0 means "inherit", which can never conflict.
         let cfg = AppConfig::from_toml(
@@ -2314,7 +2343,7 @@ mod phase2_tests {
         assert!(!cfg
             .validate()
             .iter()
-            .any(|i| matches!(i, ConfigIssue::SglakeBodyRetentionExceedsSpans { .. })));
+            .any(|i| matches!(i, ConfigIssue::SglakeBodyRetentionExceedsParent { .. })));
     }
 
     #[test]

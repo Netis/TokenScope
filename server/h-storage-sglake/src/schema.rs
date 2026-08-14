@@ -173,15 +173,24 @@ pub(crate) async fn init(backend: &SglakeBackend) -> Result<()> {
         "sglake storage backend initialized"
     );
 
-    if !backend.enable_trace_patching {
-        tracing::info!(
+    // Say this at startup rather than leaving an operator to discover an empty
+    // proxy view and wonder which layer dropped it.
+    if backend.enable_trace_patching {
+        tracing::warn!(
             target: "sglake",
-            "sglake: trace metadata patching is off (append-only store). Proxy \
-             pairing will not annotate traces; set \
-             storage.sglake.enable_trace_patching = true to opt into the \
-             dedup-on-read path, at the cost of full-window sorts on traces reads."
+            "sglake: storage.sglake.enable_trace_patching is set but not \
+             implemented on this backend, and is being ignored. Behaviour is \
+             the same as leaving it off."
         );
     }
+    tracing::info!(
+        target: "sglake",
+        "sglake: traces are append-only, so proxy pairing does not annotate \
+         them — proxy_role / proxy_peer_turn_id stay unset and the topology \
+         graph has no proxy edges. Emulating updates would put every traces \
+         read behind a full-window sort, which is what the pagination design \
+         exists to avoid."
+    );
     Ok(())
 }
 

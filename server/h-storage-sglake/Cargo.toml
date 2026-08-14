@@ -26,3 +26,6 @@ serde_json.workspace = true
 
 [dev-dependencies]
 bytes.workspace = true
+# Parses the generated props.toml back, so the stanza renderer is checked
+# against a real TOML parser rather than by eyeballing the string.
+toml_edit.workspace = true

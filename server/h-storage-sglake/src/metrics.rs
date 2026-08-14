@@ -42,6 +42,25 @@ use crate::spl::Search;
 use crate::SglakeBackend;
 
 impl SglakeBackend {
+    /// Drop duplicate metric rows before they are summed, when configured to.
+    ///
+    /// This is the read half of the `row_id` scheme: writes are at-least-once,
+    /// so a resend after a lost response can land the same logical row twice,
+    /// and every read here is a `sum`. One extra row is not a cosmetic repeat
+    /// in that arithmetic — it inflates the value. `row_id` is minted once per
+    /// row before the first send and reused across every retry, which is what
+    /// makes the second copy recognizable at all.
+    ///
+    /// Off by default because it is not free: `dedup` forces a sort and takes
+    /// the query off the columnar fast path entirely (see [`crate::spl::Search::dedup`]).
+    /// Paying that continuously to guard an event a deployment may never see
+    /// is the wrong default; turning it on after observing duplicates is not.
+    fn dedup_metrics(&self, s: &mut crate::spl::Search) {
+        if self.metrics_dedup {
+            s.dedup("row_id");
+        }
+    }
+
     pub(crate) async fn write_metrics(&self, metrics: Vec<LlmMetric>) -> Result<()> {
         if metrics.is_empty() {
             return Ok(());
@@ -110,6 +129,7 @@ impl SglakeBackend {
         };
         let mut s = Search::new(index, ST_METRIC);
         dims::apply_for_group(&mut s, &query.filter, group_by);
+        self.dedup_metrics(&mut s);
         plan.add_evals(&mut s);
 
         let by = match group_by {
@@ -158,6 +178,7 @@ impl SglakeBackend {
             .ok_or_else(|| AppError::Storage("no 10s metrics index".into()))?;
         let mut s = Search::new(index, ST_METRIC);
         dims::apply(&mut s, &query.filter);
+        self.dedup_metrics(&mut s);
 
         const COLS: &[&str] = &[
             "call_count",
@@ -234,6 +255,7 @@ impl SglakeBackend {
         // Grouping by (wire_api, model) forces the detail tier for both, even
         // when neither is filtered.
         dims::apply_for_group(&mut s, &query.filter, Some("model"));
+        self.dedup_metrics(&mut s);
         s.eval("w_ttft_p95", "ttft_p95 * ttft_count");
         s.eval("w_e2e_p95", "e2e_p95 * e2e_count");
 
@@ -334,6 +356,7 @@ impl SglakeBackend {
             &query.server_ips,
             &[],
         );
+        self.dedup_metrics(&mut s);
         let spl = format!(
             "{} | stats sum(count) as c by ts_us, finish_reason \
              | sort 0 +num(ts_us) | table ts_us, finish_reason, c",

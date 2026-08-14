@@ -134,7 +134,7 @@ path = "data/heron.duckdb"
 # there is nothing to provision. Unlike the SQL backends, stored bodies are
 # full-text searchable (`search index=heron_bodies "SELECT * FROM users"`).
 #
-# Two things about the sglogd side that Heron cannot set for you:
+# Three things about the sglogd side that Heron cannot set for you:
 #   * Start sglogd with --max-hot-raw-mib 2048 (or more). The 64 MiB default
 #     produces one bucket per few hundred spans, and search cost scales with
 #     bucket count.
@@ -142,6 +142,12 @@ path = "data/heron.duckdb"
 #     queries read columns instead of decompressing bodies. Queries stay
 #     correct without them, just far slower. Index-time settings do not apply
 #     retroactively, so merge them before ingesting in earnest.
+#   * Retention (`manage_retention` below) is pushed through sglake's index
+#     management REST API, which sglogd mounts ONLY when started with
+#     --splunk-web-dir pointing at its vendored frontend assets, and which
+#     needs a browser session when sglogd auth is on. Without both, Heron logs
+#     one warning and leaves retention alone — give sglogd its own
+#     --retention-days and set manage_retention = false.
 #
 # The /api/v1/* endpoints are unauthenticated in sglogd — bind it to loopback
 # or otherwise restrict it at the network layer.
@@ -150,12 +156,13 @@ path = "data/heron.duckdb"
 # hec_token              = ""        # matched as `Authorization: Splunk <token>`
 # index_prefix           = "heron"   # owns <prefix>_spans, _bodies, _traces, ...
 # store_bodies           = true      # false keeps metadata only (~2.7% of the footprint)
-# body_retention_days    = 0         # 0 inherits storage.retention.spans
-# manage_retention       = true      # push per-index retention on the shared schedule
+# body_retention_days    = 0         # 0 = each body index inherits its own parent
+#                                    #     (bodies <- spans, http_bodies <- http_exchanges)
+# manage_retention       = true      # push per-index TTLs on the shared schedule
 # max_body_bytes         = 33554432  # per HEC request, pre-compression
 # max_event_bytes        = 8388608   # per event; must stay under sglake's 16 MiB WAL frame
 # gzip                   = true
-# use_ack                = false
+# use_ack                = true      # ask before resending a request that failed in flight
 # write_retries          = 3
 # retry_backoff_ms       = 250
 # request_timeout_secs   = 30
@@ -164,8 +171,10 @@ path = "data/heron.duckdb"
 # max_sessions_scan      = 200000
 # max_concurrent_searches = 8
 # trace_time_skew_hours  = 6         # widens end-time windows; a trace's _time is its start
-# metrics_dedup          = false     # only needed if duplicate metric rows are observed
-# enable_trace_patching  = false     # see the backend docs: costs a full-window sort on traces reads
+# metrics_dedup          = false     # only needed if duplicate metric rows are observed;
+#                                    #   costs a sort and the columnar fast path
+# enable_trace_patching  = false     # not implemented — proxy pairing does not annotate
+#                                    #   traces on this backend; setting it true changes nothing
 
 # Storage sink batching. flush_interval_ms is the upper bound on how long a
 # single LlmCall / AgentTurn / metric row can sit in the in-memory buffer

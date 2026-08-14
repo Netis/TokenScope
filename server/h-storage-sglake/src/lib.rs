@@ -9,10 +9,13 @@
 //! Module layout mirrors `h-storage-clickhouse` so the backends diff side by
 //! side, plus two modules with no SQL counterpart:
 //!   * `schema`  — index naming + `init()` (indexes are created on first write)
-//!   * `client`  — `HecClient` (writes) + `SearchClient` (reads)
+//!   * `client`  — `HecClient` (writes), `SearchClient` (reads),
+//!     `ManagementClient` (per-index retention)
 //!   * `rows`    — domain structs → HEC events, and search rows → query types
 //!   * `spl`     — quoting, IN-lists, time windows, the pagination template
 //!   * `dims`    — the SPL equivalent of `h_storage::dialect`'s wildcard tiers
+//!   * `props`   — the recommended index-time extraction config, generated
+//!     from the `rows` structs so it cannot drift from them
 //!   * `calls` / `turns` / `sessions` / `metrics` / `services` / `exchanges` /
 //!     `distincts` / `retention` — one module per entity, same split as the
 //!     other two backends.
@@ -40,6 +43,9 @@
 //!   past that it returns a truncated graph rather than timing out.
 //! * Bodies live in their own indexes, so `include_bodies = false` genuinely
 //!   avoids fetching them rather than merely projecting them away.
+//! * `apply_retention` declares per-index TTLs instead of deleting rows, and
+//!   so always reports zero deletions. sglake freezes whole buckets on its own
+//!   timer; see [`retention`] for what that changes.
 
 mod calls;
 mod client;
@@ -48,7 +54,9 @@ mod distincts;
 mod exchanges;
 mod it;
 mod metrics;
+mod props;
 mod read;
+mod retention;
 mod rows;
 mod schema;
 mod services;
@@ -69,27 +77,27 @@ use h_storage::query::*;
 use h_storage::retention::{RetentionPolicy, RetentionReport};
 use h_storage::StorageBackend;
 
+pub use props::render as render_props;
 pub use schema::Indexes;
 
-/// sglake storage backend. Holds the two HTTP clients plus the resolved index
+/// sglake storage backend. Holds the HTTP clients plus the resolved index
 /// names and behaviour knobs.
 pub struct SglakeBackend {
     pub(crate) hec: client::HecClient,
     pub(crate) search: client::SearchClient,
+    pub(crate) management: client::ManagementClient,
     pub(crate) ix: Indexes,
     pub(crate) store_bodies: bool,
-    #[allow(dead_code)] // wired up in Phase 2 (offset-pagination guard)
     pub(crate) max_page_offset: u64,
-    #[allow(dead_code)] // wired up in Phase 2 (session list scan guard)
     pub(crate) max_sessions_scan: u64,
-    #[allow(dead_code)] // wired up in Phase 2 (trace end-time window widening)
     pub(crate) trace_time_skew_us: i64,
-    #[allow(dead_code)] // wired up in Phase 3 (metrics read dedup)
     pub(crate) metrics_dedup: bool,
-    #[allow(dead_code)] // wired up in Phase 4 (append-a-revision trace patching)
+    #[allow(dead_code)] // not implemented; `init()` says so out loud
     pub(crate) enable_trace_patching: bool,
-    #[allow(dead_code)] // wired up in Phase 4 (per-index retention push)
     pub(crate) manage_retention: bool,
+    pub(crate) body_retention_days: u32,
+    /// One warning, not one per sweep, when the management API is unreachable.
+    pub(crate) retention_warned: std::sync::atomic::AtomicBool,
 }
 
 impl SglakeBackend {
@@ -116,6 +124,7 @@ impl SglakeBackend {
         Ok(Self {
             hec: client::HecClient::new(config)?,
             search: client::SearchClient::new(config)?,
+            management: client::ManagementClient::new(config)?,
             ix,
             store_bodies: config.store_bodies,
             max_page_offset: config.max_page_offset,
@@ -124,6 +133,8 @@ impl SglakeBackend {
             metrics_dedup: config.metrics_dedup,
             enable_trace_patching: config.enable_trace_patching,
             manage_retention: config.manage_retention,
+            body_retention_days: config.body_retention_days,
+            retention_warned: std::sync::atomic::AtomicBool::new(false),
         })
     }
 }
@@ -295,13 +306,11 @@ impl StorageBackend for SglakeBackend {
         SglakeBackend::query_distinct_finish_reasons(self).await
     }
 
-    // ---- Phase 4 ---------------------------------------------------------
-
-    async fn apply_retention(&self, _policy: RetentionPolicy) -> Result<RetentionReport> {
-        // Retention in sglake is per-index and bucket-granular, pushed through
-        // its management API rather than executed as DELETEs. Wired up in
-        // Phase 4; until then this is an explicit no-op.
-        Ok(RetentionReport::default())
+    /// Declares per-index TTLs rather than deleting rows, and therefore always
+    /// reports zero deletions — see the [`retention`] module for why that is
+    /// the honest answer rather than a stub.
+    async fn apply_retention(&self, policy: RetentionPolicy) -> Result<RetentionReport> {
+        SglakeBackend::apply_retention(self, policy).await
     }
 
     async fn query_pair_candidates(

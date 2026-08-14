@@ -79,6 +79,7 @@ pub(crate) struct Search {
     terms: Vec<String>,
     wheres: Vec<String>,
     evals: Vec<String>,
+    dedup: Option<String>,
 }
 
 impl Search {
@@ -88,6 +89,7 @@ impl Search {
             terms: Vec::new(),
             wheres: Vec::new(),
             evals: Vec::new(),
+            dedup: None,
         }
     }
 
@@ -148,7 +150,25 @@ impl Search {
         self.evals.push(format!("{name}={expr}"));
     }
 
-    /// The full prefix: search terms, then `| where`, then `| eval`.
+    /// Collapse rows sharing `field` to the first of each.
+    ///
+    /// Two costs, both real. `dedup` has no streaming form here — it has to
+    /// materialize and sort — and it is not one of the stages the columnar
+    /// fast path tolerates between the search and the aggregate, so adding it
+    /// drops the whole query back to the row path. That is why the caller of
+    /// this is behind a config flag rather than always on: it buys correctness
+    /// against an event (a duplicated write) that most deployments never see.
+    ///
+    /// `field` is interpolated as a bare identifier — callers pass literals.
+    pub(crate) fn dedup(&mut self, field: &'static str) {
+        self.dedup = Some(field.to_string());
+    }
+
+    /// The full prefix: search terms, then `| where`, then `| dedup`, then
+    /// `| eval`.
+    ///
+    /// `dedup` goes before `eval` so the per-row arithmetic runs on the rows
+    /// that survive rather than the ones that do not.
     pub(crate) fn build(&self) -> String {
         let mut q = self.head.clone();
         for t in &self.terms {
@@ -158,6 +178,10 @@ impl Search {
         if !self.wheres.is_empty() {
             q.push_str(" | where ");
             q.push_str(&self.wheres.join(" AND "));
+        }
+        if let Some(f) = &self.dedup {
+            q.push_str(" | dedup ");
+            q.push_str(f);
         }
         for e in &self.evals {
             q.push_str(" | eval ");

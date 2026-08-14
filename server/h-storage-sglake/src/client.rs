@@ -1,12 +1,14 @@
-//! HTTP clients: [`HecClient`] for writes, [`SearchClient`] for reads.
+//! HTTP clients: [`HecClient`] for writes, [`SearchClient`] for reads,
+//! [`ManagementClient`] for per-index retention.
 //!
-//! Both wrap one `reqwest::Client` each (internally an `Arc`'d connection
-//! pool). We deliberately do not reuse sglog's own `sglog-agent` HEC client:
-//! it opens a fresh TCP connection per request, cannot do TLS or gzip, and
-//! discards the response body — but the response body is exactly what the
-//! retry state machine needs, since a partial-success 400 carries the index of
-//! the first bad event.
+//! Each wraps one `reqwest::Client` (internally an `Arc`'d connection pool).
+//! We deliberately do not reuse sglog's own `sglog-agent` HEC client: it opens
+//! a fresh TCP connection per request, cannot do TLS or gzip, and discards the
+//! response body — but the response body is exactly what the retry state
+//! machine needs, since a partial-success 400 carries the index of the first
+//! bad event.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use h_common::config::SglakeConfig;
@@ -46,13 +48,33 @@ fn err<E: std::fmt::Display>(ctx: &str, e: E) -> AppError {
 /// process-local and reset, so a resend can duplicate. Duplicates are visible
 /// (two rows with one id) and harmless for everything except metric sums,
 /// which is what `metrics_dedup` is for.
+///
+/// # How the ack is actually used
+///
+/// sglake issues an ack id **in the same response that reports success** — so
+/// there is no id to ask about when the response is the thing that got lost.
+/// The way through is to send every request on a **freshly minted channel**:
+/// sglake's per-channel counter starts at zero, so the only id that request
+/// could ever be given is `0`, and `POST /services/collector/ack` with
+/// `{"acks":[0]}` becomes a direct question — *did this request commit?*
+/// Measured against sglogd: `false` before the write, `true` after.
+///
+/// The answer degrades safely in every direction. sglake's channel table is
+/// in-memory and LRU-capped, so a restart or heavy churn answers `false` and
+/// we resend — exactly what would have happened with acks off. A 400 never
+/// issues an ack id, but that path is already deterministic through
+/// `invalid-event-number`, so it never consults one. The case acks cannot
+/// cover is a 500 raised after some indexes in the batch already committed:
+/// no id is issued, and the resend duplicates that prefix.
 pub(crate) struct HecClient {
     http: reqwest::Client,
     endpoint: String,
+    ack_endpoint: String,
     token: String,
     max_body_bytes: usize,
     max_event_bytes: usize,
     gzip: bool,
+    use_ack: bool,
     retries: u32,
     backoff: Duration,
 }
@@ -79,22 +101,29 @@ struct HecResponse {
     invalid_event_number: Option<usize>,
 }
 
+/// `{"acks": {"0": true}}` — the answer to an ack query.
+#[derive(Deserialize, Default)]
+struct AckResponse {
+    #[serde(default)]
+    acks: HashMap<String, bool>,
+}
+
 impl HecClient {
     pub(crate) fn new(config: &SglakeConfig) -> Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(config.request_timeout_secs))
             .build()
             .map_err(|e| err("client build", e))?;
+        let base = config.url.trim_end_matches('/');
         Ok(Self {
             http,
-            endpoint: format!(
-                "{}/services/collector/event",
-                config.url.trim_end_matches('/')
-            ),
+            endpoint: format!("{base}/services/collector/event"),
+            ack_endpoint: format!("{base}/services/collector/ack"),
             token: config.hec_token.clone(),
             max_body_bytes: config.max_body_bytes,
             max_event_bytes: config.max_event_bytes,
             gzip: config.gzip,
+            use_ack: config.use_ack,
             retries: config.write_retries,
             backoff: Duration::from_millis(config.retry_backoff_ms),
         })
@@ -211,9 +240,20 @@ impl HecClient {
             body.push(b'\n');
         }
 
+        // A channel used exactly once, so the only ack id it can be given is
+        // 0 and asking about that id asks about this request. See the type
+        // docs for why a shared channel could not answer the same question.
+        let channel = self
+            .use_ack
+            .then(|| uuid::Uuid::now_v7().to_string())
+            .filter(|_| !events.is_empty());
+
         let mut req = self.http.post(&self.endpoint);
         if !self.token.is_empty() {
             req = req.header("Authorization", format!("Splunk {}", self.token));
+        }
+        if let Some(ch) = &channel {
+            req = req.header("X-Splunk-Request-Channel", ch);
         }
         if self.gzip {
             use flate2::{write::GzEncoder, Compression};
@@ -229,7 +269,11 @@ impl HecClient {
 
         let resp = match req.body(body).send().await {
             Ok(r) => r,
-            Err(e) => return HecOutcome::Transient(e.to_string()),
+            Err(e) => {
+                return self
+                    .resolve_transient(channel.as_deref(), e.to_string())
+                    .await
+            }
         };
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
@@ -241,7 +285,9 @@ impl HecClient {
             return HecOutcome::TooLarge;
         }
         if status.is_server_error() {
-            return HecOutcome::Transient(format!("{status}: {}", truncate(&text)));
+            return self
+                .resolve_transient(channel.as_deref(), format!("{status}: {}", truncate(&text)))
+                .await;
         }
         if status.as_u16() == 400 {
             if let Ok(r) = serde_json::from_str::<HecResponse>(&text) {
@@ -252,6 +298,45 @@ impl HecClient {
             }
         }
         HecOutcome::Permanent(format!("{status}: {}", truncate(&text)))
+    }
+
+    /// The request failed in a way that leaves it genuinely unknown whether
+    /// the batch landed. With acks on, stop guessing and ask.
+    async fn resolve_transient(&self, channel: Option<&str>, msg: String) -> HecOutcome {
+        let Some(ch) = channel else {
+            return HecOutcome::Transient(msg);
+        };
+        if self.ack_committed(ch).await == Some(true) {
+            tracing::info!(
+                target: "sglake::write",
+                reason = %msg,
+                "sglake: request failed after the batch was committed; \
+                 acknowledged, so not resending"
+            );
+            return HecOutcome::Ok;
+        }
+        HecOutcome::Transient(msg)
+    }
+
+    /// `Some(true)` when sglake confirms the batch on `channel` reached disk,
+    /// `Some(false)` when it says otherwise, `None` when the question itself
+    /// could not be answered. Only `Some(true)` suppresses a resend — the
+    /// other two both mean "we do not know it landed", which is a resend.
+    pub(crate) async fn ack_committed(&self, channel: &str) -> Option<bool> {
+        let mut req = self
+            .http
+            .post(&self.ack_endpoint)
+            .query(&[("channel", channel)])
+            .json(&serde_json::json!({ "acks": [0] }));
+        if !self.token.is_empty() {
+            req = req.header("Authorization", format!("Splunk {}", self.token));
+        }
+        let resp = req.send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let parsed: AckResponse = resp.json().await.ok()?;
+        parsed.acks.get("0").copied()
     }
 }
 
@@ -367,6 +452,131 @@ impl SearchClient {
             ));
         }
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Index management (retention)
+// ---------------------------------------------------------------------------
+
+/// Per-index settings, over sglake's Splunk-compatible management REST face.
+///
+/// # This API is not always there
+///
+/// The whole `/en-US/splunkd/__raw` namespace — this endpoint included — is
+/// mounted **only when sglogd finds vendored Splunk frontend assets** at
+/// `--splunk-web-dir`. Started without them, every route here answers 404 with
+/// an empty body. A deployment that runs sglogd purely as an ingest/search
+/// engine therefore cannot be told about retention at all, and Heron has to
+/// notice that rather than log a stream of failures. That is what
+/// [`Self::list_indexes`] is for: one cheap call that answers both "is this
+/// API here?" and "which of my indexes exist yet?".
+///
+/// # And it is session-authenticated
+///
+/// When sglogd runs with auth enabled, writes here need a login session cookie
+/// plus a CSRF form key — a browser flow, not something a server-side client
+/// holds. The HEC token does **not** work. So retention management is
+/// supported for the deployment Heron actually documents (sglogd bound to
+/// loopback, auth off); anything else gets one clear warning and a no-op.
+pub(crate) struct ManagementClient {
+    http: reqwest::Client,
+    /// `…/services/sglog/settings/indexes`
+    settings_url: String,
+    /// `…/services/data/indexes`
+    list_url: String,
+}
+
+/// One index as the management API reports it.
+pub(crate) struct IndexInfo {
+    pub name: String,
+    /// `frozenTimePeriodInSecs` — the TTL after which a bucket is frozen.
+    pub frozen_after_secs: Option<i64>,
+}
+
+#[derive(Deserialize, Default)]
+struct IndexFeed {
+    #[serde(default)]
+    entry: Vec<IndexEntry>,
+}
+
+#[derive(Deserialize)]
+struct IndexEntry {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    content: serde_json::Map<String, serde_json::Value>,
+}
+
+impl ManagementClient {
+    pub(crate) fn new(config: &SglakeConfig) -> Result<Self> {
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(config.request_timeout_secs))
+            .build()
+            .map_err(|e| err("client build", e))?;
+        let base = format!("{}/en-US/splunkd/__raw", config.url.trim_end_matches('/'));
+        Ok(Self {
+            http,
+            settings_url: format!("{base}/services/sglog/settings/indexes"),
+            list_url: format!("{base}/services/data/indexes"),
+        })
+    }
+
+    /// Every index sglake currently knows about, with its retention.
+    ///
+    /// Doubles as the availability probe — see the type docs. Also the only
+    /// way to avoid guessing at 404s: pushing settings to an index that has
+    /// never been written to is a 404 that means "not yet", which is
+    /// indistinguishable by status code from the 404 that means "this API is
+    /// not mounted".
+    pub(crate) async fn list_indexes(&self) -> Result<Vec<IndexInfo>> {
+        let resp = self
+            .http
+            .get(&self.list_url)
+            .send()
+            .await
+            .map_err(|e| err("index list", e))?;
+        let status = resp.status();
+        let text = resp.text().await.map_err(|e| err("index list", e))?;
+        if !status.is_success() {
+            return Err(err(
+                "index list",
+                format!("{status} from {} — {}", self.list_url, truncate(&text)),
+            ));
+        }
+        let feed: IndexFeed = serde_json::from_str(&text).map_err(|e| err("index list", e))?;
+        Ok(feed
+            .entry
+            .into_iter()
+            .map(|e| IndexInfo {
+                name: e.name,
+                frozen_after_secs: e
+                    .content
+                    .get("frozenTimePeriodInSecs")
+                    .and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok())),
+            })
+            .collect())
+    }
+
+    /// Set one index's retention. `secs` is a TTL from event time, not a
+    /// cutoff — sglake freezes a bucket once its newest event is that old.
+    pub(crate) async fn set_retention(&self, index: &str, secs: u64) -> Result<()> {
+        let resp = self
+            .http
+            .post(format!("{}/{index}", self.settings_url))
+            .form(&[("frozen_after_secs", secs.to_string())])
+            .send()
+            .await
+            .map_err(|e| err("set retention", e))?;
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        let text = resp.text().await.unwrap_or_default();
+        Err(err(
+            "set retention",
+            format!("{status} on index {index}: {}", truncate(&text)),
+        ))
     }
 }
 
