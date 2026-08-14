@@ -1,15 +1,18 @@
 name: ebpf-soak
 
 # Quality-infra: after a staging deploy succeeds, prove heron's on-host eBPF
-# SSL-uprobe capture works END TO END on the staging VM before prod is ever
-# allowed to deploy it. Generates LLM-shaped TLS traffic on the VM and asserts
+# SSL-uprobe capture works END TO END on the staging VM before a release can
+# be cut from that commit. Generates LLM-shaped TLS traffic on the VM and asserts
 # the ebpf_* pipeline metrics moved AND a process-attributed LlmCall was
 # synthesized, parsed, and persisted (see scripts/staging/ebpf-soak.sh).
 #
 # Chains after deploy-staging, in parallel with staging-soak:
 #   ci(main) -> deploy-staging -> { staging-soak, ebpf-soak }
-# Prod promotion (deploy-prod.yml / release.yml) requires BOTH the
-# `staging-soaked` AND the `ebpf-soaked` commit statuses to be green.
+# release.yml requires BOTH the `staging-soaked` AND the `ebpf-soaked` commit
+# statuses to be green before it will build and publish a tag. Note the gate
+# outlives the artifact it guards: the published binaries are built
+# `--features console` and carry the pcap engine, not the eBPF one, so this
+# soak protects the source of truth rather than the thing prod installs.
 #
 # Runs ONLY on the dedicated `staging-deploy` self-hosted runner and ONLY for a
 # successful deploy-staging run, so no untrusted/PR code reaches the host.
@@ -34,8 +37,8 @@ jobs:
     runs-on: [self-hosted, staging-deploy]
     timeout-minutes: 15
     # statuses:write lets the final step stamp an `ebpf-soaked` commit status —
-    # the authoritative "eBPF capture is green on staging" signal the prod gate
-    # checks alongside `staging-soaked`.
+    # the authoritative "eBPF capture is green on staging" signal the release
+    # gate checks alongside `staging-soaked`.
     permissions:
       contents: read
       statuses: write
@@ -49,10 +52,10 @@ jobs:
           HERON_STAGE_USER: ${{ vars.HERON_STAGE_USER }}
         run: bash scripts/staging/ebpf-soak.sh
 
-      # Authoritative go/no-go signal for the prod-approval gate. Only the
+      # Authoritative go/no-go signal for the release gate. Only the
       # workflow_run path carries the exact deployed commit; a skipped chain
       # (CI not green) never reaches this job, so a commit with NO `ebpf-soaked`
-      # status simply hasn't been eBPF-soaked — don't promote it.
+      # status simply hasn't been eBPF-soaked — don't tag it.
       - name: Stamp `ebpf-soaked` commit status
         if: ${{ always() && github.event_name == 'workflow_run' }}
         env:
@@ -62,9 +65,9 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           if [ "$OUTCOME" = "success" ]; then
-            state="success"; desc="eBPF capture soak passed — safe to promote to prod"
+            state="success"; desc="eBPF capture soak passed — safe to release"
           else
-            state="failure"; desc="eBPF capture soak ${OUTCOME} — do NOT promote"
+            state="failure"; desc="eBPF capture soak ${OUTCOME} — do NOT release"
           fi
           # Stamp via the REST API with curl, NOT `gh`: the staging-deploy runner
           # has curl but no `gh` CLI (the same trap staging-soak.yml documents).
@@ -87,5 +90,5 @@ jobs:
             echo "- commit: \`${SHA}\`"
             echo "- $desc"
             echo ""
-            echo "Promote to prod only when this commit shows BOTH \`staging-soaked\` ✅ and \`ebpf-soaked\` ✅."
+            echo "Tag a release only from a commit that shows BOTH \`staging-soaked\` ✅ and \`ebpf-soaked\` ✅."
           } >> "$GITHUB_STEP_SUMMARY"

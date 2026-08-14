@@ -1,123 +1,75 @@
 name: deploy-prod
 
-# Promote a staging-soaked build to PRODUCTION. Gated two ways:
-#   1. a manual approval — the `production` GitHub Environment's required
-#      reviewers must approve before the job runs;
-#   2. a post-deploy health gate with automatic rollback (deploy-prod.sh).
+# Put a published RELEASE on the production host.
 #
-# Chains after the staging pipeline (two soaks run in parallel after deploy):
-#   ci(main) → deploy-staging → { staging-soak, ebpf-soak } → [approval] → deploy-prod
-# This run is triggered by staging-soak; a post-approval gate step then asserts
-# the deployed commit ALSO carries a passing `ebpf-soaked` status, so prod is
-# only ever promoted once BOTH staging gates are green.
+# Prod tracks releases, not `main`. Cutting a tag is the deliberate act, and
+# release.yml already refuses to build a tag whose commit is not both
+# `staging-soaked` and `ebpf-soaked` — so by the time a release exists, the
+# gate a human used to approve here has already been enforced by machine. This
+# workflow is what makes "release" mean "shipped" instead of "downloadable":
 #
-# Security: runs ONLY on the `prod-deploy` self-hosted runner ON the prod host
-# and ONLY after a successful staging-soak (or manual dispatch). The label is
-# not shared with PR CI, so PR/fork code never reaches the prod host. The prod
-# checkout path comes from a repo Variable, never committed source.
+#   ci(main) → deploy-staging → { staging-soak, ebpf-soak } → tag v* →
+#   release.yml (gate + build + publish) → deploy-prod (this) → prod on the release
+#
+# Security: runs ONLY on the `prod-deploy` self-hosted runner ON the prod host,
+# and only on `release: published` / manual dispatch — neither of which a fork
+# or PR can raise. The label is not shared with PR CI, so untrusted code never
+# reaches the prod host. The deploy installs the published, checksummed artifact
+# rather than building on the host.
 on:
-  workflow_run:
-    workflows: [staging-soak]
-    types: [completed]
-  # Manual lever: deploy a chosen commit (default origin/main) on demand.
+  release:
+    types: [published]
+  # Manual lever: redeploy, or pin prod to a specific (e.g. earlier) release.
   workflow_dispatch:
     inputs:
-      sha:
-        description: commit to deploy (default origin/main)
+      tag:
+        description: "release tag to deploy (default: latest release)"
         required: false
 
-# Supersede, don't pile up. Every merge to main triggers a deploy-prod that
-# parks in `waiting` for manual approval. With cancel-in-progress: false those
-# unapproved runs accumulated, and because a waiting run holds the group, the
-# FIRST un-approved one blocked every later one as `pending` forever (the prod
-# pipeline wedge of 2026-06-03 — manual `gh run cancel` was the only way out).
-# cancel-in-progress: true makes a newer deploy-prod cancel the older waiting
-# one, so there is always exactly ONE waiting run — the latest main — ready to
-# approve. (deploy-prod.sh builds before touching the service and is health-
-# gated + auto-rollback, so a cancel during the brief approved-and-running
-# window is safe; the next run redeploys latest cleanly.)
+# One prod deploy at a time, and let an in-flight one finish: cancelling
+# mid-install would leave the host between binaries. Two releases published
+# back to back queue, and the later one lands last, which is the order wanted.
 concurrency:
   group: deploy-prod
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   deploy:
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: [self-hosted, prod-deploy]
-    # Requires manual approval — the `production` environment is configured
-    # with required reviewers. GitHub pauses here until a reviewer approves.
-    environment: production
-    timeout-minutes: 30
-    # statuses:read lets the gate step below verify the deployed commit passed
-    # BOTH staging gates before prod is touched.
+    timeout-minutes: 20
     permissions:
       contents: read
-      statuses: read
     steps:
+      # For `release: published` this checks out the tagged tree, so the deploy
+      # script that runs is the one that shipped with the release.
       - uses: actions/checkout@v4
 
-      - name: resolve commit to deploy
+      - name: resolve release tag
         id: pick
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.sha }}" ]; then
-            sha="${{ github.event.inputs.sha }}"
-          elif [ "${{ github.event_name }}" = "workflow_run" ]; then
-            sha="${{ github.event.workflow_run.head_sha }}"
+          if [ "${{ github.event_name }}" = "release" ]; then
+            tag="${{ github.event.release.tag_name }}"
           else
-            sha="origin/main"
+            tag="${{ github.event.inputs.tag }}"
           fi
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
-          echo "deploying commit: $sha"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "deploying release: ${tag:-<latest>}"
 
-      # Machine-enforced promotion gate (runs POST-approval, so by the time a
-      # reviewer approves both parallel soaks have stamped their status). The
-      # automatic pipeline path (workflow_run) MUST carry passing `staging-soaked`
-      # AND `ebpf-soaked` statuses on the deployed commit. Polls briefly in case
-      # ebpf-soak is still finishing when staging-soak triggered this run.
-      # A manual workflow_dispatch is the deliberate operator-override escape
-      # hatch and is not hard-gated (warn only).
-      - name: require staging-soaked + ebpf-soaked
-        if: github.event_name == 'workflow_run'
+      - name: install the release on prod + gate on health (rollback on failure)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SHA: ${{ github.event.workflow_run.head_sha }}
+          HERON_PROD_BIN: ${{ vars.HERON_PROD_BIN }}
+          HERON_PROD_SERVICE: ${{ vars.HERON_PROD_SERVICE }}
+          HERON_PROD_PORT: ${{ vars.HERON_PROD_PORT }}
+        run: bash scripts/prod/deploy-prod.sh "${{ steps.pick.outputs.tag }}"
+
+      - name: summary
+        if: always()
         run: |
-          set -euo pipefail
-          # Latest state for one status context, parsed from the combined-status
-          # JSON on stdin. One-line python so it stays inside this YAML block
-          # scalar (a 0-indented heredoc would terminate the scalar early).
-          ctx_state() {
-            printf '%s' "$1" | python3 -c "import sys,json; d=json.load(sys.stdin); ss=sorted([s for s in d.get('statuses',[]) if s.get('context')==sys.argv[1]], key=lambda s: s.get('updated_at','')); print(ss[-1]['state'] if ss else 'none')" "$2"
-          }
-          for attempt in $(seq 1 30); do
-            statuses="$(curl -fsS \
-              -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              -H "X-GitHub-Api-Version: 2022-11-28" \
-              "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/commits/$SHA/status")"
-            s_staging="$(ctx_state "$statuses" staging-soaked)"
-            s_ebpf="$(ctx_state "$statuses" ebpf-soaked)"
-            echo "attempt $attempt: staging-soaked=$s_staging ebpf-soaked=$s_ebpf"
-            if [ "$s_staging" = success ] && [ "$s_ebpf" = success ]; then
-              echo "✓ both staging gates green on $SHA — clear to deploy to prod"
-              exit 0
-            fi
-            # Hard-fail immediately on an explicit failure; only poll while a
-            # gate is still pending/absent (parallel soak not done yet).
-            if [ "$s_staging" = failure ] || [ "$s_ebpf" = failure ]; then
-              echo "::error::a staging gate FAILED on $SHA (staging-soaked=$s_staging ebpf-soaked=$s_ebpf) — refusing to promote to prod"
-              exit 1
-            fi
-            sleep 10
-          done
-          echo "::error::staging gates not green on $SHA within timeout (staging-soaked=$s_staging ebpf-soaked=$s_ebpf) — refusing to promote to prod"
-          exit 1
-
-      - name: note manual-dispatch gate bypass
-        if: github.event_name == 'workflow_dispatch'
-        run: echo "::warning::manual deploy-prod dispatch — staging-soaked/ebpf-soaked gate is NOT auto-enforced (deliberate operator override). Verify both statuses on the target commit yourself."
-
-      - name: deploy to prod + health gate (rollback on failure)
-        env:
-          HERON_PROD_REPO_DIR: ${{ vars.HERON_PROD_REPO_DIR }}
-        run: bash scripts/prod/deploy-prod.sh "${{ steps.pick.outputs.sha }}"
+          {
+            echo "### deploy-prod → \`${{ steps.pick.outputs.tag }}\`"
+            echo ""
+            echo "- outcome: **${{ job.status }}**"
+            echo "- prod installs the published artifact and verifies its SHA256 before restarting."
+            echo "- the gate is \`/api/health\` **plus** a read-path smoke over every console endpoint."
+          } >> "$GITHUB_STEP_SUMMARY"
