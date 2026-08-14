@@ -62,6 +62,7 @@ pub(crate) fn in_list(field: &str, values: &[String]) -> Option<String> {
 
 /// A literal `==` comparison for the `| where` stage. Use when the value may
 /// contain `*`, or when comparing against sglake's own rollup sentinels.
+#[allow(dead_code)] // used from Phase 2 onward (list filters)
 pub(crate) fn where_eq(field: &str, value: &str) -> String {
     format!("{field} == {}", quote(value))
 }
@@ -73,7 +74,11 @@ pub(crate) fn where_eq(field: &str, value: &str) -> String {
 /// query can do here, so they should always be set. `"0"` means unbounded and
 /// forces a full scan.
 pub(crate) fn epoch_secs(us: i64) -> String {
-    format!("{}.{:06}", us.div_euclid(1_000_000), us.rem_euclid(1_000_000))
+    format!(
+        "{}.{:06}",
+        us.div_euclid(1_000_000),
+        us.rem_euclid(1_000_000)
+    )
 }
 
 /// Chunk size for `id IN (...)` point lookups. Keeps a single query string
@@ -95,6 +100,7 @@ pub(crate) const ID_CHUNK: usize = 512;
 /// `id`): equal `_time` values order by storage order, which changes when hot
 /// buckets are sealed or merged, and unstable ordering makes pagination drop
 /// or repeat rows.
+#[allow(dead_code)] // used from Phase 2 onward (list pagination)
 pub(crate) fn paginate(
     search: &str,
     sort_keys: &str,
@@ -112,8 +118,52 @@ pub(crate) fn paginate(
 /// The companion count query. A pipeline's `total` is the number of rows it
 /// *emitted*, not the number matched, so the page size and the total have to
 /// come from two different queries.
+#[allow(dead_code)] // used from Phase 2 onward (page totals)
 pub(crate) fn count_query(search: &str) -> String {
     format!("{search} | stats count as n | table n")
+}
+
+/// Fetch whole events rather than columns.
+///
+/// Reads always go through `_raw` and are deserialized in Rust, never assembled
+/// from the extracted fields beside it. Search output is lossy in three ways
+/// that all corrupt a struct silently: a null field is dropped rather than
+/// returned as null, a single-element multivalue collapses into a bare scalar,
+/// and an integer past 2^53 comes back as a string. `_raw` has none of those
+/// problems — it is the event as written.
+pub(crate) fn raw_query(search: &str, limit: usize) -> String {
+    format!("{search} | head {limit} | table _raw")
+}
+
+/// Widen a point lookup's time window by this much on each side, in
+/// microseconds. Covers clock skew between the capture host and the id
+/// minting, plus a turn that is still open when its id is generated.
+const ID_WINDOW_SKEW_US: i64 = 6 * 3_600_000_000;
+
+/// Best-effort `(earliest, latest)` derived from a UUIDv7's embedded
+/// millisecond timestamp.
+///
+/// Every id Heron mints is a UUIDv7, so a by-id lookup can usually prune to a
+/// handful of buckets instead of consulting every bucket in the retention
+/// window. Two cases make this a hint rather than a fact, and both are why
+/// callers must fall back to an unbounded retry when the window comes up
+/// empty:
+///
+/// * `turn_id` can come from the provider (Codex sends its own), in which case
+///   it is not a UUIDv7 at all and this returns `None`.
+/// * The id is minted when the pipeline sees the record, but `_time` comes
+///   from the packet. Replaying a captured pcap makes those years apart, so
+///   the derived window would exclude the very event it is looking for —
+///   which is exactly how the test corpus and the staging soak run.
+pub(crate) fn id_window(id: &str) -> Option<(String, String)> {
+    let uuid = uuid::Uuid::parse_str(id).ok()?;
+    let ts = uuid.get_timestamp()?;
+    let (secs, nanos) = ts.to_unix();
+    let us = i64::try_from(secs).ok()?.checked_mul(1_000_000)? + (nanos / 1000) as i64;
+    Some((
+        epoch_secs(us.saturating_sub(ID_WINDOW_SKEW_US)),
+        epoch_secs(us.saturating_add(ID_WINDOW_SKEW_US)),
+    ))
 }
 
 #[cfg(test)]
@@ -185,7 +235,13 @@ mod tests {
 
     #[test]
     fn paginate_writes_explicit_sort_limit_and_table() {
-        let q = paginate("search index=x", "-num(ts_us), -str(id)", 100, 50, &["id", "ts_us"]);
+        let q = paginate(
+            "search index=x",
+            "-num(ts_us), -str(id)",
+            100,
+            50,
+            &["id", "ts_us"],
+        );
         assert!(q.contains("| sort 150 -num(ts_us), -str(id)"), "{q}");
         assert!(q.contains("| tail 50"), "{q}");
         assert!(q.ends_with("| table id, ts_us"), "{q}");

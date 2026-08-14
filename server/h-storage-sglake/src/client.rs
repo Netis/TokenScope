@@ -248,11 +248,7 @@ impl HecClient {
                 if let Some(k) = r.invalid_event_number {
                     return HecOutcome::PartialUpTo(k);
                 }
-                return HecOutcome::Permanent(format!(
-                    "400 code={} {}",
-                    r.code,
-                    truncate(&r.text)
-                ));
+                return HecOutcome::Permanent(format!("400 code={} {}", r.code, truncate(&r.text)));
             }
         }
         HecOutcome::Permanent(format!("{status}: {}", truncate(&text)))
@@ -272,8 +268,15 @@ pub(crate) type Row = serde_json::Map<String, serde_json::Value>;
 
 #[derive(Deserialize, Default)]
 pub(crate) struct SearchResult {
+    /// `results` or `events`, depending on whether the pipeline ended in a
+    /// transforming command. Kept for diagnostics.
+    #[allow(dead_code)]
     #[serde(default)]
     pub mode: String,
+    /// Rows **emitted**, not rows matched — a pipeline redefines it. Page
+    /// totals therefore come from a separate `| stats count` query, added in
+    /// Phase 2.
+    #[allow(dead_code)]
     #[serde(default)]
     pub total: u64,
     #[serde(default)]
@@ -358,7 +361,10 @@ impl SearchClient {
             .await
             .map_err(|e| err("connect", e))?;
         if !resp.status().is_success() {
-            return Err(err("connect", format!("{} from {}", resp.status(), self.ping_url)));
+            return Err(err(
+                "connect",
+                format!("{} from {}", resp.status(), self.ping_url),
+            ));
         }
         Ok(())
     }
@@ -410,9 +416,10 @@ mod tests {
 
     #[test]
     fn partial_success_response_parses_invalid_event_number() {
-        let r: HecResponse =
-            serde_json::from_str(r#"{"text":"Invalid data format","code":6,"invalid-event-number":7}"#)
-                .unwrap();
+        let r: HecResponse = serde_json::from_str(
+            r#"{"text":"Invalid data format","code":6,"invalid-event-number":7}"#,
+        )
+        .unwrap();
         assert_eq!(r.invalid_event_number, Some(7));
         assert_eq!(r.code, 6);
 

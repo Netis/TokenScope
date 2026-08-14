@@ -1,4 +1,4 @@
-//! `spans` — write path.
+//! `spans` — write path and point lookups.
 //!
 //! One call becomes up to two events in two different indexes: metadata in
 //! `<prefix>_spans` and, when there is anything to store, bodies+headers in
@@ -9,11 +9,22 @@
 //! partial failure can leave a span without its body (the console then shows
 //! the body as unavailable) but never a body without its span.
 
-use h_common::error::Result;
-use h_llm::model::LlmCall;
+use std::collections::HashMap;
 
-use crate::rows::{span_events, Envelope, ST_BODY, ST_SPAN};
+use h_common::error::Result;
+use h_common::process::ProcessInfo;
+use h_llm::model::LlmCall;
+use h_storage::query::{SpanDetail, TraceSpanItem};
+
+use crate::rows::{span_events, BodyEvent, Envelope, SpanEvent, ST_BODY, ST_SPAN};
+use crate::spl::{in_list, match_term, ID_CHUNK};
 use crate::SglakeBackend;
+
+/// Microseconds → milliseconds, the unit the detail and trace-span types use.
+/// (`HttpExchangeDetail` is the one exception and stays in microseconds.)
+pub(crate) fn ms(us: i64) -> i64 {
+    us / 1000
+}
 
 impl SglakeBackend {
     pub(crate) async fn write_spans(&self, calls: Vec<LlmCall>) -> Result<()> {
@@ -39,7 +50,7 @@ impl SglakeBackend {
                 }
             }
             if let Some(body) = body {
-                match Envelope::new(ts, &host, ST_BODY, &self.ix.bodies, body).encode() {
+                match crate::rows::raw_envelope(ts, &host, ST_BODY, &self.ix.bodies, &body) {
                     Ok(s) => events.push(s),
                     Err(e) => tracing::error!(
                         target: "sglake::write", id = %call.id, error = %e,
@@ -49,5 +60,199 @@ impl SglakeBackend {
             }
         }
         self.hec.send(events).await
+    }
+
+    pub(crate) async fn query_span_by_id(&self, id: &str) -> Result<Option<SpanDetail>> {
+        let ix = &self.ix.spans;
+        let Some(term) = match_term("id", id) else {
+            // An id containing `*` cannot be a term without becoming a glob,
+            // and Heron never mints one. Treating it as "not found" is both
+            // correct and refuses to run a full-index wildcard scan.
+            return Ok(None);
+        };
+        let search = format!("search index={ix} sourcetype={ST_SPAN} {term}");
+        let Some(e) = self
+            .fetch_raw_by_id::<SpanEvent>("query_span_by_id", &search, 1, id)
+            .await?
+            .into_iter()
+            .next()
+        else {
+            return Ok(None);
+        };
+
+        let body = if e.has_body {
+            self.fetch_bodies(&[id.to_string()]).await?.remove(id)
+        } else {
+            None
+        };
+        let (request_body, response_body, request_headers, response_headers) = match body {
+            Some(b) => (
+                b.request_body,
+                b.response_body,
+                b.request_headers,
+                b.response_headers,
+            ),
+            None => (None, None, None, None),
+        };
+
+        Ok(Some(SpanDetail {
+            id: e.id,
+            source_id: e.source_id,
+            request_time: ms(e.ts_us),
+            response_time: e.resp_us.map(ms),
+            complete_time: e.done_us.map(ms),
+            wire_api: e.wire_api,
+            model: e.model,
+            api_type: e.api_type,
+            is_stream: e.is_stream,
+            request_path: e.request_path,
+            status_code: e.status_code,
+            finish_reason: e.finish_reason,
+            input_tokens: e.input_tokens,
+            output_tokens: e.output_tokens,
+            total_tokens: e.total_tokens,
+            tokens_estimated: e.tokens_estimated,
+            ttft_ms: e.ttft_ms,
+            e2e_latency_ms: e.e2e_latency_ms,
+            response_id: e.response_id,
+            client_ip: e.client_ip,
+            client_port: e.client_port,
+            server_ip: e.server_ip,
+            server_port: e.server_port,
+            request_body,
+            response_body,
+            request_headers,
+            response_headers,
+            is_agent_request: e.is_agent_request,
+            tool_surface: e.tool_surface,
+            agent_topology: e.agent_topology,
+            tool_call_count: e.tool_call_count,
+            tool_names: h_storage::convert::parse_json_string_list(Some(&e.tool_names_json)),
+            process: e.process_pid.map(|pid| ProcessInfo {
+                pid,
+                comm: e.process_comm.clone().unwrap_or_default(),
+                exe: e.process_exe.clone(),
+            }),
+        }))
+    }
+
+    /// Fetch calls by id list.
+    ///
+    /// Shared by `query_trace_spans` (ids from the persisted trace) and
+    /// `query_spans_by_ids` (ids from the in-memory active-turn registry).
+    /// Calls not yet flushed simply do not come back, same as on the SQL
+    /// backends.
+    ///
+    /// `window` is the caller's time bounds when it has better information
+    /// than the ids do — `query_trace_spans` knows the turn's real start and
+    /// end, which beats anything derivable from a UUID and stays correct
+    /// under pcap replay.
+    pub(crate) async fn read_spans_by_ids(
+        &self,
+        span_ids: &[String],
+        include_bodies: bool,
+        window: Option<(String, String)>,
+    ) -> Result<Vec<TraceSpanItem>> {
+        if span_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut events: Vec<SpanEvent> = Vec::with_capacity(span_ids.len());
+        for chunk in span_ids.chunks(ID_CHUNK) {
+            let ix = &self.ix.spans;
+            let Some(list) = in_list("id", chunk) else {
+                continue;
+            };
+            let search = format!("search index={ix} sourcetype={ST_SPAN} {list}");
+            let found: Vec<SpanEvent> = match &window {
+                Some((earliest, latest)) => {
+                    self.fetch_raw("read_spans_by_ids", &search, chunk.len(), earliest, latest)
+                        .await?
+                }
+                // No caller window: bound by the ids themselves, unbounded on
+                // a miss. `chunk[0]` is representative — a trace's calls are
+                // minted within seconds of each other, well inside the skew.
+                None => {
+                    self.fetch_raw_by_id("read_spans_by_ids", &search, chunk.len(), &chunk[0])
+                        .await?
+                }
+            };
+            events.extend(found);
+        }
+
+        // Ordering is done here rather than in SPL. The list is bounded by the
+        // caller's id set, the values are already decoded as integers, and
+        // sorting in the query would mean comparing `done_us` as an extracted
+        // string field. The trailing `id` key is a deterministic tie-break the
+        // SQL backends lack: equal timestamps there order arbitrarily.
+        events.sort_by(|a, b| {
+            a.ts_us
+                .cmp(&b.ts_us)
+                .then(a.done_us.cmp(&b.done_us))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+
+        let mut bodies = if include_bodies {
+            let ids: Vec<String> = events.iter().map(|e| e.id.clone()).collect();
+            self.fetch_bodies(&ids).await?
+        } else {
+            HashMap::new()
+        };
+
+        Ok(events
+            .into_iter()
+            .enumerate()
+            .map(|(i, e)| {
+                let b = bodies.remove(&e.id).unwrap_or_default();
+                TraceSpanItem {
+                    id: e.id,
+                    sequence: (i as u32) + 1,
+                    request_time: ms(e.ts_us),
+                    response_time: e.resp_us.map(ms),
+                    complete_time: e.done_us.map(ms),
+                    wire_api: e.wire_api,
+                    model: e.model,
+                    status_code: e.status_code,
+                    is_stream: e.is_stream,
+                    finish_reason: e.finish_reason,
+                    ttft_ms: e.ttft_ms,
+                    e2e_latency_ms: e.e2e_latency_ms,
+                    input_tokens: e.input_tokens,
+                    output_tokens: e.output_tokens,
+                    // Precomputed at write time, so this is the same answer
+                    // with and without bodies. The SQL backends derive it from
+                    // the response body and therefore disagree in lite mode.
+                    tokens_estimated: e.tokens_estimated,
+                    request_path: e.request_path,
+                    client_ip: e.client_ip,
+                    client_port: e.client_port,
+                    server_ip: e.server_ip,
+                    server_port: e.server_port,
+                    request_body: b.request_body,
+                    response_body: b.response_body,
+                    request_headers: b.request_headers,
+                    response_headers: b.response_headers,
+                }
+            })
+            .collect())
+    }
+
+    /// Second hop of the no-JOIN read: bodies for a set of span ids, keyed by
+    /// span id. Missing ids are simply absent from the map.
+    async fn fetch_bodies(&self, span_ids: &[String]) -> Result<HashMap<String, BodyEvent>> {
+        let mut out = HashMap::with_capacity(span_ids.len());
+        for chunk in span_ids.chunks(ID_CHUNK) {
+            let ix = &self.ix.bodies;
+            let Some(list) = in_list("span_id", chunk) else {
+                continue;
+            };
+            let search = format!("search index={ix} sourcetype={ST_BODY} {list}");
+            let found: Vec<BodyEvent> = self
+                .fetch_raw_by_id("fetch_bodies", &search, chunk.len(), &chunk[0])
+                .await?;
+            for b in found {
+                out.insert(b.span_id.clone(), b);
+            }
+        }
+        Ok(out)
     }
 }

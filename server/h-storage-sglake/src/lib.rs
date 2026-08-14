@@ -43,9 +43,14 @@
 
 mod calls;
 mod client;
+mod exchanges;
+mod it;
+mod metrics;
+mod read;
 mod rows;
 mod schema;
 mod spl;
+mod turns;
 
 use async_trait::async_trait;
 
@@ -69,6 +74,7 @@ pub struct SglakeBackend {
     pub(crate) search: client::SearchClient,
     pub(crate) ix: Indexes,
     pub(crate) store_bodies: bool,
+    #[allow(dead_code)] // wired up in Phase 2 (offset-pagination guard)
     pub(crate) max_page_offset: u64,
     #[allow(dead_code)] // wired up in Phase 2 (session list scan guard)
     pub(crate) max_sessions_scan: u64,
@@ -87,10 +93,26 @@ impl SglakeBackend {
     /// indexes are materialized lazily on first write, and `init()` only
     /// probes and reports.
     pub fn new(config: &SglakeConfig) -> Result<Self> {
+        // Refuse a prefix that would land Heron's data in one of sglake's own
+        // indexes. `traces` is the dangerous one: it already holds OTLP spans,
+        // including the ones sglogd writes about its own searches, and mixing
+        // in Heron events would corrupt a dataset this backend does not own.
+        let ix = Indexes::new(&config.index_prefix);
+        if let Some(clash) = ix
+            .all()
+            .into_iter()
+            .find(|n| schema::RESERVED_INDEXES.contains(n))
+        {
+            return Err(h_common::error::AppError::Config(format!(
+                "storage.sglake.index_prefix = {:?} produces the reserved sglake \
+                 index {:?}; choose another prefix",
+                config.index_prefix, clash
+            )));
+        }
         Ok(Self {
             hec: client::HecClient::new(config)?,
             search: client::SearchClient::new(config)?,
-            ix: Indexes::new(&config.index_prefix),
+            ix,
             store_bodies: config.store_bodies,
             max_page_offset: config.max_page_offset,
             max_sessions_scan: config.max_sessions_scan,
@@ -116,18 +138,6 @@ macro_rules! unimplemented_read {
     }};
 }
 
-/// Same idea for write paths. Returning `Ok` would claim a durable write that
-/// never happened, so these return `Err` — the sink counts it as a flush
-/// error and it shows up in the pipeline health view.
-macro_rules! unimplemented_write {
-    ($entity:literal) => {{
-        Err(h_common::error::AppError::Storage(format!(
-            "sglake backend: {} writes are not implemented yet",
-            $entity
-        )))
-    }};
-}
-
 #[async_trait]
 impl StorageBackend for SglakeBackend {
     async fn init(&self) -> Result<()> {
@@ -138,46 +148,61 @@ impl StorageBackend for SglakeBackend {
         SglakeBackend::write_spans(self, calls).await
     }
 
-    async fn write_metrics(&self, _metrics: Vec<LlmMetric>) -> Result<()> {
-        unimplemented_write!("llm_metrics")
+    async fn write_metrics(&self, metrics: Vec<LlmMetric>) -> Result<()> {
+        SglakeBackend::write_metrics(self, metrics).await
     }
 
-    async fn write_finish_metrics(&self, _metrics: Vec<LlmFinishMetric>) -> Result<()> {
-        unimplemented_write!("llm_finish_metrics")
+    async fn write_finish_metrics(&self, metrics: Vec<LlmFinishMetric>) -> Result<()> {
+        SglakeBackend::write_finish_metrics(self, metrics).await
     }
 
-    async fn write_traces(&self, _turns: Vec<Trace>) -> Result<()> {
-        unimplemented_write!("traces")
+    async fn write_traces(&self, turns: Vec<Trace>) -> Result<()> {
+        SglakeBackend::write_traces(self, turns).await
     }
 
-    async fn write_exchanges(&self, _exchanges: Vec<HttpExchange>) -> Result<()> {
-        unimplemented_write!("http_exchanges")
+    async fn write_exchanges(&self, exchanges: Vec<HttpExchange>) -> Result<()> {
+        SglakeBackend::write_exchanges(self, exchanges).await
     }
 
     // ---- Phase 2: lists + pagination -------------------------------------
 
     async fn query_spans(&self, _query: &SpansQuery) -> Result<SpansPage> {
-        unimplemented_read!("query_spans", SpansPage { items: Vec::new(), total: 0 })
+        unimplemented_read!(
+            "query_spans",
+            SpansPage {
+                items: Vec::new(),
+                total: 0
+            }
+        )
     }
 
     async fn query_traces(&self, _query: &TracesQuery) -> Result<TracesPage> {
-        unimplemented_read!("query_traces", TracesPage { items: Vec::new(), total: 0 })
+        unimplemented_read!(
+            "query_traces",
+            TracesPage {
+                items: Vec::new(),
+                total: 0
+            }
+        )
     }
 
-    async fn query_http_exchanges(
-        &self,
-        _query: &HttpExchangesQuery,
-    ) -> Result<HttpExchangesPage> {
+    async fn query_http_exchanges(&self, _query: &HttpExchangesQuery) -> Result<HttpExchangesPage> {
         unimplemented_read!(
             "query_http_exchanges",
-            HttpExchangesPage { items: Vec::new(), total: 0 }
+            HttpExchangesPage {
+                items: Vec::new(),
+                total: 0
+            }
         )
     }
 
     async fn query_sessions(&self, _query: &SessionListQuery) -> Result<SessionsPage> {
         unimplemented_read!(
             "query_sessions",
-            SessionsPage { items: Vec::new(), next_cursor: None }
+            SessionsPage {
+                items: Vec::new(),
+                next_cursor: None
+            }
         )
     }
 
@@ -189,44 +214,47 @@ impl StorageBackend for SglakeBackend {
         unimplemented_read!("query_session_by_id", None)
     }
 
-    async fn query_session_traces(
-        &self,
-        _query: &SessionTracesQuery,
-    ) -> Result<SessionTracesPage> {
+    async fn query_session_traces(&self, _query: &SessionTracesQuery) -> Result<SessionTracesPage> {
         unimplemented_read!(
             "query_session_traces",
-            SessionTracesPage { items: Vec::new(), next_cursor: None }
+            SessionTracesPage {
+                items: Vec::new(),
+                next_cursor: None
+            }
         )
     }
 
     // ---- Phase 1: point lookups ------------------------------------------
 
-    async fn query_span_by_id(&self, _id: &str) -> Result<Option<SpanDetail>> {
-        unimplemented_read!("query_span_by_id", None)
+    async fn query_span_by_id(&self, id: &str) -> Result<Option<SpanDetail>> {
+        SglakeBackend::query_span_by_id(self, id).await
     }
 
-    async fn query_trace_by_id(&self, _turn_id: &str) -> Result<Option<TraceDetail>> {
-        unimplemented_read!("query_trace_by_id", None)
+    async fn query_trace_by_id(&self, turn_id: &str) -> Result<Option<TraceDetail>> {
+        SglakeBackend::query_trace_by_id(self, turn_id).await
     }
 
     async fn query_trace_spans(
         &self,
-        _turn_id: &str,
-        _include_bodies: bool,
+        turn_id: &str,
+        include_bodies: bool,
     ) -> Result<Vec<TraceSpanItem>> {
-        unimplemented_read!("query_trace_spans", Vec::new())
+        SglakeBackend::query_trace_spans(self, turn_id, include_bodies).await
     }
 
     async fn query_spans_by_ids(
         &self,
-        _span_ids: &[String],
-        _include_bodies: bool,
+        span_ids: &[String],
+        include_bodies: bool,
     ) -> Result<Vec<TraceSpanItem>> {
-        unimplemented_read!("query_spans_by_ids", Vec::new())
+        // No turn to borrow a time window from — these ids come from the
+        // in-memory registry for turns that have not been persisted yet, so
+        // the ids themselves are the only bound available.
+        SglakeBackend::read_spans_by_ids(self, span_ids, include_bodies, None).await
     }
 
-    async fn query_http_exchange_by_id(&self, _id: &str) -> Result<Option<HttpExchangeDetail>> {
-        unimplemented_read!("query_http_exchange_by_id", None)
+    async fn query_http_exchange_by_id(&self, id: &str) -> Result<Option<HttpExchangeDetail>> {
+        SglakeBackend::query_http_exchange_by_id(self, id).await
     }
 
     // ---- Phase 3: aggregates ---------------------------------------------
@@ -283,7 +311,10 @@ impl StorageBackend for SglakeBackend {
     ) -> Result<ServicesTopology> {
         unimplemented_read!(
             "query_services_topology",
-            ServicesTopology { nodes: Vec::new(), edges: Vec::new() }
+            ServicesTopology {
+                nodes: Vec::new(),
+                edges: Vec::new()
+            }
         )
     }
 
