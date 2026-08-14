@@ -1445,10 +1445,19 @@ async fn distincts_and_agent_rollups() {
 
     // The summary's contract comes from the SQL backends: `last_seen_ms` is
     // the latest turn *start*, and rows come back busiest-first.
+    //
+    // claude-cli's two turns start at `base` and `base + 1s` and each run for
+    // a second, so max(start) and max(end) are a full second apart — which is
+    // what makes this able to tell them apart at all.
+    assert_eq!(
+        summary[0].agent_kind, "claude-cli",
+        "busiest kind first: {summary:?}"
+    );
     assert_eq!(
         summary[0].last_seen_ms,
-        (base + 2_000_000) / 1000,
-        "last_seen_ms is max(start), not max(end)"
+        (base + 1_000_000) / 1000,
+        "last_seen_ms is max(start); max(end) would be {}",
+        (base + 2_000_000) / 1000
     );
     assert!(
         summary[0].turn_count >= summary[1].turn_count,
