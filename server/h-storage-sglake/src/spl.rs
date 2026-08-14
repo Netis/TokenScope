@@ -62,9 +62,115 @@ pub(crate) fn in_list(field: &str, values: &[String]) -> Option<String> {
 
 /// A literal `==` comparison for the `| where` stage. Use when the value may
 /// contain `*`, or when comparing against sglake's own rollup sentinels.
-#[allow(dead_code)] // used from Phase 2 onward (list filters)
 pub(crate) fn where_eq(field: &str, value: &str) -> String {
     format!("{field} == {}", quote(value))
+}
+
+/// A search and the post-search stages that go with it.
+///
+/// Filters land in one of two places. Most become `search` terms, which push
+/// down to postings. A value containing `*` cannot: there is no escape for it
+/// in a search term, so it would silently turn into a glob and match rows the
+/// user never asked for. Those get routed into a `| where` stage instead,
+/// which compares literally. The split is per-filter, so one awkward model
+/// name costs index pushdown on that filter alone.
+pub(crate) struct Search {
+    head: String,
+    terms: Vec<String>,
+    wheres: Vec<String>,
+    evals: Vec<String>,
+}
+
+impl Search {
+    pub(crate) fn new(index: &str, sourcetype: &str) -> Self {
+        Self {
+            head: format!("search index={index} sourcetype={sourcetype}"),
+            terms: Vec::new(),
+            wheres: Vec::new(),
+            evals: Vec::new(),
+        }
+    }
+
+    /// `field` matches any of `values`. An empty list is *no filter at all* —
+    /// never "match nothing".
+    ///
+    /// On a field holding an array (`models_used`), this is an any-element
+    /// match, which is what the SQL backends express as `hasAny` /
+    /// `list_has_any`.
+    pub(crate) fn any_of(&mut self, field: &str, values: &[String]) {
+        if values.is_empty() {
+            return;
+        }
+        if values.iter().any(|v| needs_literal_compare(v)) {
+            let ors: Vec<String> = values.iter().map(|v| where_eq(field, v)).collect();
+            self.wheres.push(format!("({})", ors.join(" OR ")));
+        } else if let Some(t) = in_list(field, values) {
+            self.terms.push(t);
+        }
+    }
+
+    /// Same, for numeric values — no quoting hazard, so always a term.
+    pub(crate) fn any_of_nums<T: std::fmt::Display>(&mut self, field: &str, values: &[T]) {
+        if values.is_empty() {
+            return;
+        }
+        let items: Vec<String> = values.iter().map(|v| v.to_string()).collect();
+        self.terms
+            .push(format!("{field} IN ({})", items.join(", ")));
+    }
+
+    pub(crate) fn eq_num(&mut self, field: &str, value: impl std::fmt::Display) {
+        self.terms.push(format!("{field}={value}"));
+    }
+
+    /// Substring match. This is the one predicate that cannot use an index —
+    /// a non-prefix wildcard scans. Measured at ~18× a term match, which is
+    /// slow but not disqualifying, so it stays rather than being restricted to
+    /// a prefix.
+    pub(crate) fn contains(&mut self, field: &str, substr: &str) {
+        // The value is spliced into a glob, so `*` in user input would widen
+        // the match rather than narrow it. Comparing literally is not an
+        // option here (there is no substring operator on the search side), so
+        // the wildcards the user typed are the wildcards they get — the same
+        // thing `LIKE '%…%'` does with `%` on the SQL backends.
+        self.terms
+            .push(format!("{field}=\"*{}*\"", glob_body(substr)));
+    }
+
+    /// Half-open `[lo, hi)` on a numeric field. Range predicates cannot push
+    /// down, hence the `| where`.
+    pub(crate) fn range(&mut self, field: &str, lo: i64, hi: i64) {
+        self.wheres.push(format!("{field}>={lo} AND {field}<{hi}"));
+    }
+
+    /// Add a computed field, available to later `sort` stages.
+    pub(crate) fn eval(&mut self, name: &str, expr: &str) {
+        self.evals.push(format!("{name}={expr}"));
+    }
+
+    /// The full prefix: search terms, then `| where`, then `| eval`.
+    pub(crate) fn build(&self) -> String {
+        let mut q = self.head.clone();
+        for t in &self.terms {
+            q.push(' ');
+            q.push_str(t);
+        }
+        if !self.wheres.is_empty() {
+            q.push_str(" | where ");
+            q.push_str(&self.wheres.join(" AND "));
+        }
+        for e in &self.evals {
+            q.push_str(" | eval ");
+            q.push_str(e);
+        }
+        q
+    }
+}
+
+/// Escape a value for use inside a `"*…*"` glob, leaving `*` alone (see
+/// [`Search::contains`]).
+fn glob_body(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 /// Convert Heron's microsecond timestamp to the epoch-seconds string the
@@ -88,19 +194,26 @@ pub(crate) const ID_CHUNK: usize = 512;
 /// Build the offset-pagination pipeline.
 ///
 /// `sort <offset+limit>` immediately after `search` keeps the executor on its
-/// bounded top-k path (O(2N) memory) instead of materializing the window;
-/// `| tail <limit>` then takes exactly the requested page; and the trailing
-/// `| table` switches the response into "results" mode, which is **not**
-/// subject to `max_events`. The sort limit is always written explicitly —
-/// a bare `| sort f` means `sort 10000 f` in current sglog
+/// bounded top-k path (O(2N) memory) instead of materializing the window, and
+/// the trailing `| table` switches the response into "results" mode, which is
+/// **not** subject to `max_events`. The sort limit is always written
+/// explicitly — a bare `| sort f` means `sort 10000 f` in current sglog
 /// (`sglog-spl/src/commands.rs`), and older builds do not apply that cap at
 /// all, so relying on either behaviour would be version-dependent.
 ///
+/// The window itself is cut with `streamstats` + `where` on the row number
+/// rather than the more obvious `| tail <limit>`, which is wrong three ways:
+/// it **reverses** the rows it returns; past the end of the result set it
+/// returns the last page over and over instead of nothing, so paging never
+/// terminates; and on a partial last page it returns a full page reaching back
+/// into rows the previous page already showed. Numbering the rows and taking
+/// `(offset, offset+limit]` has none of those problems and costs one streaming
+/// counter.
+///
 /// `sort_keys` must already include a deterministic tie-break (`ts_us` then
-/// `id`): equal `_time` values order by storage order, which changes when hot
-/// buckets are sealed or merged, and unstable ordering makes pagination drop
-/// or repeat rows.
-#[allow(dead_code)] // used from Phase 2 onward (list pagination)
+/// `id`): equal sort values otherwise order by storage order, which changes
+/// when hot buckets are sealed or merged, and unstable ordering makes
+/// pagination drop or repeat rows.
 pub(crate) fn paginate(
     search: &str,
     sort_keys: &str,
@@ -108,9 +221,10 @@ pub(crate) fn paginate(
     limit: u64,
     columns: &[&str],
 ) -> String {
+    let end = offset + limit;
     format!(
-        "{search} | sort {} {sort_keys} | tail {limit} | table {}",
-        offset + limit,
+        "{search} | sort {end} {sort_keys} \
+         | streamstats count as _rn | where _rn>{offset} AND _rn<={end} | table {}",
         columns.join(", ")
     )
 }
@@ -118,7 +232,6 @@ pub(crate) fn paginate(
 /// The companion count query. A pipeline's `total` is the number of rows it
 /// *emitted*, not the number matched, so the page size and the total have to
 /// come from two different queries.
-#[allow(dead_code)] // used from Phase 2 onward (page totals)
 pub(crate) fn count_query(search: &str) -> String {
     format!("{search} | stats count as n | table n")
 }
@@ -233,8 +346,10 @@ mod tests {
         assert_eq!(epoch_secs(-1), "-1.999999");
     }
 
+    /// The window must be cut by row number, not by `| tail` — see
+    /// [`paginate`] for the three ways `tail` gets this wrong.
     #[test]
-    fn paginate_writes_explicit_sort_limit_and_table() {
+    fn paginate_cuts_the_window_by_row_number() {
         let q = paginate(
             "search index=x",
             "-num(ts_us), -str(id)",
@@ -243,7 +358,134 @@ mod tests {
             &["id", "ts_us"],
         );
         assert!(q.contains("| sort 150 -num(ts_us), -str(id)"), "{q}");
-        assert!(q.contains("| tail 50"), "{q}");
+        assert!(q.contains("| streamstats count as _rn"), "{q}");
+        assert!(q.contains("| where _rn>100 AND _rn<=150"), "{q}");
+        assert!(!q.contains("| tail"), "tail reverses and overruns: {q}");
         assert!(q.ends_with("| table id, ts_us"), "{q}");
+    }
+
+    /// The first page starts at row 1, so the lower bound must be exclusive-0
+    /// rather than something that skips it.
+    #[test]
+    fn paginate_first_page_starts_at_row_one() {
+        let q = paginate("search index=x", "-num(ts_us)", 0, 20, &["_raw"]);
+        assert!(q.contains("| sort 20 "), "{q}");
+        assert!(q.contains("| where _rn>0 AND _rn<=20"), "{q}");
+    }
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::*;
+
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn plain_values_become_pushdown_terms() {
+        let mut s = Search::new("heron_spans", "heron_span");
+        s.any_of("model", &v(&["gpt-4", "claude"]));
+        s.any_of_nums("status_code", &[200u16, 404]);
+        s.eq_num("strm", 1);
+        let q = s.build();
+        assert_eq!(
+            q,
+            r#"search index=heron_spans sourcetype=heron_span model IN ("gpt-4", "claude") status_code IN (200, 404) strm=1"#
+        );
+        assert!(!q.contains("| where"), "no where stage needed: {q}");
+    }
+
+    /// An empty filter list means "no filter", never "match nothing" —
+    /// conflating those silently empties every page.
+    #[test]
+    fn empty_lists_add_no_predicate() {
+        let mut s = Search::new("i", "st");
+        s.any_of("model", &[]);
+        s.any_of_nums::<u16>("status_code", &[]);
+        assert_eq!(s.build(), "search index=i sourcetype=st");
+    }
+
+    /// A value containing `*` would become a glob in a search term and match
+    /// rows the user never asked for. It has to move to a literal compare.
+    #[test]
+    fn wildcard_values_move_to_a_literal_where_stage() {
+        let mut s = Search::new("i", "st");
+        s.any_of("model", &v(&["gpt-4", "weird*name"]));
+        let q = s.build();
+        assert!(!q.contains("model IN"), "must not push down as a glob: {q}");
+        assert_eq!(
+            q,
+            r#"search index=i sourcetype=st | where (model == "gpt-4" OR model == "weird*name")"#
+        );
+    }
+
+    /// One awkward value must not cost pushdown on unrelated filters.
+    #[test]
+    fn wildcard_routing_is_per_filter() {
+        let mut s = Search::new("i", "st");
+        s.any_of("model", &v(&["a*b"]));
+        s.any_of("wire_api", &v(&["openai-chat"]));
+        let q = s.build();
+        assert!(q.contains(r#"wire_api IN ("openai-chat")"#), "{q}");
+        assert!(q.contains(r#"| where (model == "a*b")"#), "{q}");
+    }
+
+    /// The injection payload: close the string and append another clause.
+    ///
+    /// The payload text still appears in the query — it has to, it is the
+    /// value being matched. What matters is that its `"` is escaped, so the
+    /// whole thing stays one string literal and `| delete` is data rather than
+    /// a pipeline stage.
+    #[test]
+    fn breakout_payloads_stay_inside_their_literal() {
+        let mut s = Search::new("i", "st");
+        s.any_of("model", &v(&[r#"x" OR index=secret | delete "#]));
+        assert_eq!(
+            s.build(),
+            r#"search index=i sourcetype=st model IN ("x\" OR index=secret | delete ")"#
+        );
+
+        // Every `"` after the opening delimiter must be escaped.
+        let mut s2 = Search::new("i", "st");
+        s2.any_of("model", &v(&[r#"a" b" c"#]));
+        let q = s2.build();
+        let literal = &q[q.find('(').unwrap() + 2..q.rfind('"').unwrap()];
+        let mut chars = literal.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                chars.next();
+            } else {
+                assert_ne!(c, '"', "unescaped quote leaked into {q}");
+            }
+        }
+
+        // A trailing backslash must not escape the closing delimiter.
+        let mut s3 = Search::new("i", "st");
+        s3.any_of("model", &v(&[r#"a\"#]));
+        assert!(s3.build().contains(r#""a\\""#), "{}", s3.build());
+    }
+
+    #[test]
+    fn stages_are_ordered_search_then_where_then_eval() {
+        let mut s = Search::new("i", "st");
+        s.any_of("model", &v(&["m"]));
+        s.range("end_us", 10, 20);
+        s.eval("dur_ms", "(done_us - ts_us) / 1000");
+        assert_eq!(
+            s.build(),
+            r#"search index=i sourcetype=st model IN ("m") | where end_us>=10 AND end_us<20 | eval dur_ms=(done_us - ts_us) / 1000"#
+        );
+    }
+
+    #[test]
+    fn contains_wraps_in_a_glob_and_escapes_quotes() {
+        let mut s = Search::new("i", "st");
+        s.contains("request_path", r#"/v1/"chat"#);
+        assert!(
+            s.build().ends_with(r#"request_path="*/v1/\"chat*""#),
+            "{}",
+            s.build()
+        );
     }
 }

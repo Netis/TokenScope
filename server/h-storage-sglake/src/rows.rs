@@ -373,6 +373,15 @@ pub(crate) struct TraceEvent {
     pub proxy_pair_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_peer_turn_id: Option<String>,
+    /// Every other member of the proxy group. Absent on direct turns.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_peer_turn_ids_json: Option<String>,
+    /// 1 when the pair sweeper folded this turn into a peer, i.e. the traces
+    /// list hides it unless `include_proxy_hops` is set. Precomputed because
+    /// the predicate it replaces is a negation (`role NOT IN (…)`), and sglake
+    /// cannot push those down — nor can it distinguish "role is absent" from
+    /// "role is something else" without one.
+    pub proxy_hidden: u8,
     pub tool_surfaces_json: String,
     pub tool_call_total: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -380,17 +389,38 @@ pub(crate) struct TraceEvent {
     pub suspicious_skills_json: String,
 }
 
-/// Pull `metadata.proxy.{role,pair_id,peer_turn_id}` up to top level.
-fn proxy_fields(metadata: &serde_json::Value) -> (Option<String>, Option<String>, Option<String>) {
+/// Pull the `metadata.proxy` block up to top level.
+struct Proxy {
+    role: Option<String>,
+    pair_id: Option<String>,
+    peer_turn_id: Option<String>,
+    peer_turn_ids: Option<Vec<String>>,
+}
+
+fn proxy_fields(metadata: &serde_json::Value) -> Proxy {
     let Some(p) = metadata.get("proxy") else {
-        return (None, None, None);
+        return Proxy {
+            role: None,
+            pair_id: None,
+            peer_turn_id: None,
+            peer_turn_ids: None,
+        };
     };
     let s = |k: &str| p.get(k).and_then(|v| v.as_str()).map(str::to_string);
-    (s("role"), s("pair_id"), s("peer_turn_id"))
+    Proxy {
+        role: s("role"),
+        pair_id: s("pair_id"),
+        peer_turn_id: s("peer_turn_id"),
+        peer_turn_ids: p.get("peer_turn_ids").and_then(|v| v.as_array()).map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect()
+        }),
+    }
 }
 
 pub(crate) fn trace_event(t: &Trace) -> TraceEvent {
-    let (proxy_role, proxy_pair_id, proxy_peer_turn_id) = proxy_fields(&t.metadata);
+    let proxy = proxy_fields(&t.metadata);
     let tool_surfaces: Vec<String> = t.tool_surfaces.iter().map(|s| s.to_string()).collect();
     TraceEvent {
         turn_id: t.turn_id.clone(),
@@ -421,9 +451,14 @@ pub(crate) fn trace_event(t: &Trace) -> TraceEvent {
         span_ids_json: json_list(&t.span_ids),
         first_span_id: t.span_ids.first().cloned(),
         metadata_json: t.metadata.to_string(),
-        proxy_role,
-        proxy_pair_id,
-        proxy_peer_turn_id,
+        proxy_hidden: u8::from(matches!(
+            proxy.role.as_deref(),
+            Some("proxy_out") | Some("mirror_secondary")
+        )),
+        proxy_role: proxy.role,
+        proxy_pair_id: proxy.pair_id,
+        proxy_peer_turn_id: proxy.peer_turn_id,
+        proxy_peer_turn_ids_json: proxy.peer_turn_ids.as_deref().map(json_list),
         tool_surfaces_json: json_list(&tool_surfaces),
         tool_call_total: t.tool_call_total,
         agent_topology: t.agent_topology.map(|a| a.to_string()),

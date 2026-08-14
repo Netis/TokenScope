@@ -8,13 +8,23 @@
 
 use h_common::error::Result;
 use h_storage::convert::parse_json_string_list;
-use h_storage::query::{TraceDetail, TraceSpanItem};
+use h_storage::query::{TraceDetail, TraceListItem, TraceSpanItem, TracesPage, TracesQuery};
 use h_turn::Trace;
 
 use crate::calls::ms;
+use crate::read::Sort;
 use crate::rows::{trace_event, Envelope, TraceEvent, ST_TRACE};
-use crate::spl::match_term;
+use crate::spl::{match_term, Search};
 use crate::SglakeBackend;
+
+const TRACE_SORT: &[(&str, &str)] = &[
+    ("start_time", "num(ts_us)"),
+    ("end_time", "num(end_us)"),
+    ("duration_ms", "num(duration_ms)"),
+    ("call_count", "num(call_count)"),
+    ("total_input_tokens", "num(total_input_tokens)"),
+    ("total_output_tokens", "num(total_output_tokens)"),
+];
 
 impl SglakeBackend {
     pub(crate) async fn write_traces(&self, turns: Vec<Trace>) -> Result<()> {
@@ -35,6 +45,61 @@ impl SglakeBackend {
             }
         }
         self.hec.send(events).await
+    }
+
+    pub(crate) async fn query_traces(&self, query: &TracesQuery) -> Result<TracesPage> {
+        let sort = Sort::new(
+            &query.sort_by,
+            &query.sort_order,
+            TRACE_SORT,
+            &["num(ts_us)", "str(turn_id)"],
+        )?;
+
+        let mut s = Search::new(&self.ix.traces, ST_TRACE);
+        s.any_of("wire_api", &query.filter.wire_apis);
+        // `models_used` is stored as an array, and a match against an array
+        // field is an any-element match — the same semantics as the SQL
+        // backends' `hasAny` / `list_has_any`.
+        s.any_of("models_used", &query.filter.models);
+        s.any_of("server_ip", &query.filter.server_ips);
+        s.any_of("client_ip", &query.client_ips);
+        s.any_of("status", &query.statuses);
+        s.any_of("agent_kind", &query.agent_kinds);
+        if !query.include_proxy_hops {
+            // Precomputed at write time; see `TraceEvent::proxy_hidden`.
+            s.eq_num("proxy_hidden", 0);
+        }
+        if !query.server_ports.is_empty() {
+            // A trace has no port of its own, so this resolves through its
+            // first call, exactly as the SQL backends do — they just get to
+            // express it as a subquery.
+            let ids = self
+                .span_ids_on_ports(&query.server_ports, &query.time_range)
+                .await?;
+            if ids.is_empty() {
+                return Ok(TracesPage {
+                    total: 0,
+                    items: Vec::new(),
+                });
+            }
+            s.any_of("first_span_id", &ids);
+        }
+
+        let (events, total) = self
+            .fetch_page::<TraceEvent>(
+                "query_traces",
+                &s,
+                &sort,
+                query.page,
+                query.page_size,
+                &query.time_range,
+            )
+            .await?;
+
+        Ok(TracesPage {
+            total,
+            items: events.into_iter().map(trace_list_item).collect(),
+        })
     }
 
     /// Read one trace by its turn id.
@@ -80,6 +145,41 @@ impl SglakeBackend {
         let window = self.window(t.ts_us, t.end_us);
         self.read_spans_by_ids(&span_ids, include_bodies, Some(window))
             .await
+    }
+}
+
+fn trace_list_item(e: TraceEvent) -> TraceListItem {
+    let models_used = parse_json_string_list(Some(&e.models_used_json));
+    TraceListItem {
+        turn_id: e.turn_id,
+        source_id: e.source_id,
+        session_id: e.session_id,
+        start_time: ms(e.ts_us),
+        end_time: ms(e.end_us),
+        duration_ms: e.duration_ms,
+        wire_api: e.wire_api,
+        agent_kind: e.agent_kind,
+        client_ip: e.client_ip,
+        server_ip: e.server_ip,
+        primary_model: models_used.first().cloned(),
+        models_used,
+        call_count: e.call_count,
+        total_input_tokens: e.total_input_tokens,
+        total_output_tokens: e.total_output_tokens,
+        status: e.status,
+        final_finish_reason: e.final_finish_reason,
+        user_input_preview: e.user_input_preview,
+        final_answer_preview: e.final_answer_preview,
+        proxy_role: e.proxy_role,
+        proxy_peer_turn_id: e.proxy_peer_turn_id,
+        proxy_peer_turn_ids: e
+            .proxy_peer_turn_ids_json
+            .as_deref()
+            .map(|s| parse_json_string_list(Some(s))),
+        tool_surfaces: parse_json_string_list(Some(&e.tool_surfaces_json)),
+        tool_call_total: e.tool_call_total,
+        agent_topology: e.agent_topology,
+        suspicious_skills: serde_json::from_str(&e.suspicious_skills_json).unwrap_or_default(),
     }
 }
 

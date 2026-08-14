@@ -49,6 +49,7 @@ mod metrics;
 mod read;
 mod rows;
 mod schema;
+mod sessions;
 mod spl;
 mod turns;
 
@@ -166,62 +167,32 @@ impl StorageBackend for SglakeBackend {
 
     // ---- Phase 2: lists + pagination -------------------------------------
 
-    async fn query_spans(&self, _query: &SpansQuery) -> Result<SpansPage> {
-        unimplemented_read!(
-            "query_spans",
-            SpansPage {
-                items: Vec::new(),
-                total: 0
-            }
-        )
+    async fn query_spans(&self, query: &SpansQuery) -> Result<SpansPage> {
+        SglakeBackend::query_spans(self, query).await
     }
 
-    async fn query_traces(&self, _query: &TracesQuery) -> Result<TracesPage> {
-        unimplemented_read!(
-            "query_traces",
-            TracesPage {
-                items: Vec::new(),
-                total: 0
-            }
-        )
+    async fn query_traces(&self, query: &TracesQuery) -> Result<TracesPage> {
+        SglakeBackend::query_traces(self, query).await
     }
 
-    async fn query_http_exchanges(&self, _query: &HttpExchangesQuery) -> Result<HttpExchangesPage> {
-        unimplemented_read!(
-            "query_http_exchanges",
-            HttpExchangesPage {
-                items: Vec::new(),
-                total: 0
-            }
-        )
+    async fn query_http_exchanges(&self, query: &HttpExchangesQuery) -> Result<HttpExchangesPage> {
+        SglakeBackend::query_http_exchanges(self, query).await
     }
 
-    async fn query_sessions(&self, _query: &SessionListQuery) -> Result<SessionsPage> {
-        unimplemented_read!(
-            "query_sessions",
-            SessionsPage {
-                items: Vec::new(),
-                next_cursor: None
-            }
-        )
+    async fn query_sessions(&self, query: &SessionListQuery) -> Result<SessionsPage> {
+        SglakeBackend::query_sessions(self, query).await
     }
 
     async fn query_session_by_id(
         &self,
-        _source_id: &str,
-        _session_id: &str,
+        source_id: &str,
+        session_id: &str,
     ) -> Result<Option<SessionDetail>> {
-        unimplemented_read!("query_session_by_id", None)
+        SglakeBackend::query_session_by_id(self, source_id, session_id).await
     }
 
-    async fn query_session_traces(&self, _query: &SessionTracesQuery) -> Result<SessionTracesPage> {
-        unimplemented_read!(
-            "query_session_traces",
-            SessionTracesPage {
-                items: Vec::new(),
-                next_cursor: None
-            }
-        )
+    async fn query_session_traces(&self, query: &SessionTracesQuery) -> Result<SessionTracesPage> {
+        SglakeBackend::query_session_traces(self, query).await
     }
 
     // ---- Phase 1: point lookups ------------------------------------------

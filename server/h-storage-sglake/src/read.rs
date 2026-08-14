@@ -17,8 +17,10 @@
 use serde::de::DeserializeOwned;
 
 use h_common::error::Result;
+use h_storage::query::TimeRange;
 
-use crate::spl::{self, raw_query};
+use crate::client::Row;
+use crate::spl::{self, raw_query, Search};
 use crate::SglakeBackend;
 
 impl SglakeBackend {
@@ -39,26 +41,7 @@ impl SglakeBackend {
             .search
             .search(&raw_query(search, limit), earliest, latest)
             .await?;
-        let mut out = Vec::new();
-        let mut undecodable = 0usize;
-        for row in result.rows() {
-            match row.get("_raw").and_then(|v| v.as_str()) {
-                Some(raw) => match serde_json::from_str::<T>(raw) {
-                    Ok(v) => out.push(v),
-                    Err(_) => undecodable += 1,
-                },
-                None => undecodable += 1,
-            }
-        }
-        if undecodable > 0 {
-            tracing::warn!(
-                target: "sglake::read",
-                query = what,
-                skipped = undecodable,
-                "sglake: skipped event(s) that could not be decoded"
-            );
-        }
-        Ok(out)
+        Ok(decode_rows(what, result.rows()))
     }
 
     /// A point lookup bounded by the id's own UUIDv7 timestamp, retried
@@ -94,6 +77,122 @@ impl SglakeBackend {
             spl::epoch_secs(end_us.saturating_add(self.trace_time_skew_us)),
         )
     }
+
+    /// One page of whole events, plus the matching total.
+    ///
+    /// The two come from two queries because a pipeline's reported `total` is
+    /// the number of rows it *emitted*, not the number matched — after
+    /// `| tail`, that would always equal the page size. They run concurrently
+    /// since neither depends on the other.
+    pub(crate) async fn fetch_page<T: DeserializeOwned>(
+        &self,
+        what: &'static str,
+        search: &Search,
+        sort: &Sort,
+        page: u32,
+        page_size: u32,
+        range: &TimeRange,
+    ) -> Result<(Vec<T>, u64)> {
+        let page_size = page_size.max(1) as u64;
+        let offset = (page.saturating_sub(1)) as u64 * page_size;
+        // Offset pagination reads `offset + page_size` rows to discard all but
+        // the last page_size. That is fine for the first few hundred pages and
+        // ruinous past that, so the ceiling is an explicit error rather than a
+        // request that quietly takes minutes.
+        if offset > self.max_page_offset {
+            return Err(h_common::error::AppError::Storage(format!(
+                "sglake backend: page offset {offset} exceeds \
+                 storage.sglake.max_page_offset ({}); narrow the time range or \
+                 filters instead of paging this deep",
+                self.max_page_offset
+            )));
+        }
+
+        let prefix = search.build();
+        let (earliest, latest) = (
+            spl::epoch_secs(range.start_us),
+            spl::epoch_secs(range.end_us),
+        );
+        let items_spl = spl::paginate(&prefix, &sort.keys, offset, page_size, &["_raw"]);
+        let count_spl = spl::count_query(&prefix);
+
+        let (items, count) = tokio::try_join!(
+            self.search.search(&items_spl, &earliest, &latest),
+            self.search.search(&count_spl, &earliest, &latest),
+        )?;
+
+        let total = count
+            .rows()
+            .first()
+            .and_then(|r| r.get("n"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        Ok((decode_rows(what, items.rows()), total))
+    }
+}
+
+/// Decode `_raw` out of each row, skipping (and reporting) any that will not
+/// parse. See [`SglakeBackend::fetch_raw`] for why `_raw` and not the fields.
+pub(crate) fn decode_rows<T: DeserializeOwned>(what: &'static str, rows: Vec<Row>) -> Vec<T> {
+    let mut out = Vec::with_capacity(rows.len());
+    let mut undecodable = 0usize;
+    for row in rows {
+        match row.get("_raw").and_then(|v| v.as_str()) {
+            Some(raw) => match serde_json::from_str::<T>(raw) {
+                Ok(v) => out.push(v),
+                Err(_) => undecodable += 1,
+            },
+            None => undecodable += 1,
+        }
+    }
+    if undecodable > 0 {
+        tracing::warn!(
+            target: "sglake::read",
+            query = what,
+            skipped = undecodable,
+            "sglake: skipped event(s) that could not be decoded"
+        );
+    }
+    out
+}
+
+/// A validated sort specification.
+///
+/// `sort_by` arrives from the API as a free string, and it is spliced into the
+/// query, so it is checked against a whitelist exactly as the SQL backends
+/// check theirs. Every key set ends with a deterministic tie-break: rows with
+/// equal sort values otherwise come back in bucket storage order, which
+/// changes when hot buckets are sealed or merged — and an unstable order makes
+/// offset pagination drop and repeat rows across pages.
+pub(crate) struct Sort {
+    pub keys: String,
+}
+
+impl Sort {
+    pub(crate) fn new(
+        sort_by: &str,
+        sort_order: &str,
+        allowed: &[(&str, &str)],
+        tie_break: &[&str],
+    ) -> Result<Self> {
+        let Some((_, expr)) = allowed.iter().find(|(name, _)| *name == sort_by) else {
+            return Err(h_common::error::AppError::Storage(format!(
+                "invalid sort_by field: {sort_by}"
+            )));
+        };
+        let sign = if sort_order.eq_ignore_ascii_case("ASC") {
+            '+'
+        } else {
+            '-'
+        };
+        let mut keys = format!("{sign}{expr}");
+        for t in tie_break {
+            // Same direction as the primary key: any fixed choice gives a
+            // total order, and matching keeps the tie-break invisible.
+            keys.push_str(&format!(", {sign}{t}"));
+        }
+        Ok(Self { keys })
+    }
 }
 
 #[cfg(test)]
@@ -125,5 +224,49 @@ mod tests {
         assert!(id_window("").is_none());
         assert!(id_window(&uuid::Uuid::new_v4().to_string()).is_none());
         assert!(id_window("not-a-uuid-at-all-really").is_none());
+    }
+}
+
+#[cfg(test)]
+mod sort_tests {
+    use super::Sort;
+
+    const ALLOWED: &[(&str, &str)] = &[("request_time", "num(ts_us)"), ("ttft_ms", "num(ttft_ms)")];
+
+    #[test]
+    fn sort_appends_a_deterministic_tie_break() {
+        let s = Sort::new("request_time", "DESC", ALLOWED, &["num(ts_us)", "str(id)"]).unwrap();
+        assert_eq!(s.keys, "-num(ts_us), -num(ts_us), -str(id)");
+        let s = Sort::new("ttft_ms", "asc", ALLOWED, &["str(id)"]).unwrap();
+        assert_eq!(s.keys, "+num(ttft_ms), +str(id)");
+    }
+
+    /// `sort_by` is spliced into the query, so anything off the whitelist has
+    /// to be refused rather than passed through.
+    #[test]
+    fn sort_rejects_anything_off_the_whitelist() {
+        for bad in ["", "id", "ts_us", "1) | delete", "num(ts_us)"] {
+            assert!(
+                Sort::new(bad, "DESC", ALLOWED, &[]).is_err(),
+                "accepted {bad:?}"
+            );
+        }
+    }
+
+    /// Anything that is not "asc" descends, matching the SQL backends.
+    #[test]
+    fn sort_order_defaults_to_descending() {
+        assert!(Sort::new("request_time", "", ALLOWED, &[])
+            .unwrap()
+            .keys
+            .starts_with('-'));
+        assert!(Sort::new("request_time", "nonsense", ALLOWED, &[])
+            .unwrap()
+            .keys
+            .starts_with('-'));
+        assert!(Sort::new("request_time", "ASC", ALLOWED, &[])
+            .unwrap()
+            .keys
+            .starts_with('+'));
     }
 }

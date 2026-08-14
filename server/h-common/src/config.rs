@@ -1219,6 +1219,23 @@ pub enum ConfigIssue {
     /// Only emitted when `spans_days > 0` — infinite calls retention can
     /// satisfy any turns retention.
     TracesRetentionExceedsSpans { traces_days: u32, spans_days: u32 },
+    /// `storage.sglake.index_prefix` is not a usable index-name token, so the
+    /// backend would write under names nobody expects — an empty prefix in
+    /// particular lands in sglake's own leading-underscore namespace. Only
+    /// emitted when `storage.backend == "sglake"`.
+    SglakeReservedIndexPrefix { prefix: String, index: String },
+    /// `storage.sglake.max_event_bytes` is smaller than a single capped body
+    /// can be, so full-size events are dropped before they are ever sent.
+    /// That is silent data loss at steady state, not an edge case. Only
+    /// emitted when `storage.backend == "sglake"`.
+    SglakeEventCapBelowBodyCap {
+        max_event_bytes: usize,
+        body_cap_bytes: usize,
+    },
+    /// Body indexes are set to outlive the span metadata that points at them,
+    /// leaving bodies nothing can reach. `0` means "inherit", which is always
+    /// consistent. Only emitted when `storage.backend == "sglake"`.
+    SglakeBodyRetentionExceedsSpans { body_days: u32, spans_days: u32 },
 }
 
 impl ConfigIssue {
@@ -1230,13 +1247,18 @@ impl ConfigIssue {
         match self {
             Self::NoPipelines
             | Self::NoSourcesInPipeline { .. }
-            | Self::PcapDumpRetentionNoRules { .. } => IssueSeverity::Warn,
+            | Self::PcapDumpRetentionNoRules { .. }
+            // Orphaned bodies waste space but break nothing: the metadata
+            // rows that would reference them are already gone.
+            | Self::SglakeBodyRetentionExceedsSpans { .. } => IssueSeverity::Warn,
             Self::DuplicatePipelineName(_)
             | Self::DuplicateSourceId { .. }
             | Self::StoragePathParentUnwritable { .. }
             | Self::UnknownRetentionGranularity(_)
             | Self::UnsafePcapDumpPipelineName { .. }
-            | Self::TracesRetentionExceedsSpans { .. } => IssueSeverity::Error,
+            | Self::TracesRetentionExceedsSpans { .. }
+            | Self::SglakeReservedIndexPrefix { .. }
+            | Self::SglakeEventCapBelowBodyCap { .. } => IssueSeverity::Error,
         }
     }
 }
@@ -1320,6 +1342,34 @@ impl std::fmt::Display for ConfigIssue {
                      lists. Set traces <= spans (or set spans = 0 for infinite)."
                 )
             }
+            Self::SglakeReservedIndexPrefix { prefix, index } => write!(
+                f,
+                "storage.sglake.index_prefix '{prefix}' is not a usable index \
+                 name token (it would produce '{index}'). Use lowercase \
+                 letters, digits and underscores, and do not start with '_' \
+                 — that is sglake's own namespace."
+            ),
+            Self::SglakeEventCapBelowBodyCap {
+                max_event_bytes,
+                body_cap_bytes,
+            } => write!(
+                f,
+                "storage.sglake.max_event_bytes ({max_event_bytes}) is below \
+                 the {body_cap_bytes} bytes a capped body can reach, so \
+                 full-size events would be dropped before being sent. Raise \
+                 max_event_bytes or lower [body_cap]."
+            ),
+            Self::SglakeBodyRetentionExceedsSpans {
+                body_days,
+                spans_days,
+            } => write!(
+                f,
+                "storage.sglake.body_retention_days ({body_days}d) outlives \
+                 storage.retention.spans ({spans_days}d): bodies will survive \
+                 the span metadata that points at them and become \
+                 unreachable. Set body_retention_days <= spans (or 0 to \
+                 inherit it)."
+            ),
         }
     }
 }
@@ -1456,6 +1506,48 @@ impl AppConfig {
                 traces_days,
                 spans_days,
             });
+        }
+
+        if self.storage.backend == "sglake" {
+            let sg = &self.storage.sglake;
+            // sglake has no DDL — an index exists because something wrote to
+            // it — so a malformed prefix is never rejected by the store. It
+            // just starts writing under a name nobody expects. The exact
+            // reserved-name collision check lives in the backend, which owns
+            // index naming; what this layer can check is that the prefix is a
+            // usable token at all. An empty prefix in particular yields
+            // `_spans`, and leading-underscore indexes are sglake's own
+            // namespace.
+            let prefix = sg.index_prefix.as_str();
+            if prefix.is_empty()
+                || !prefix
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                || prefix.starts_with('_')
+            {
+                issues.push(ConfigIssue::SglakeReservedIndexPrefix {
+                    prefix: sg.index_prefix.clone(),
+                    index: format!("{prefix}_spans"),
+                });
+            }
+            // A body at the cap plus its headers and JSON escaping has to fit
+            // in one event, or the write path drops it every time.
+            if self.body_cap.enabled {
+                let body_cap_bytes = self.body_cap.head_bytes + self.body_cap.tail_bytes;
+                if sg.store_bodies && sg.max_event_bytes < body_cap_bytes {
+                    issues.push(ConfigIssue::SglakeEventCapBelowBodyCap {
+                        max_event_bytes: sg.max_event_bytes,
+                        body_cap_bytes,
+                    });
+                }
+            }
+            let spans_days = self.storage.retention.spans;
+            if spans_days > 0 && sg.body_retention_days > spans_days {
+                issues.push(ConfigIssue::SglakeBodyRetentionExceedsSpans {
+                    body_days: sg.body_retention_days,
+                    spans_days,
+                });
+            }
         }
 
         if self.storage.backend == "duckdb" {
@@ -2023,6 +2115,206 @@ mod phase2_tests {
         let cfg = AppConfig::from_toml(&toml);
         let issues = cfg.validate();
         assert!(issues.is_empty(), "expected no issues, got {issues:?}");
+    }
+
+    /// The sglake checks must stay dormant for every other backend —
+    /// `[storage.sglake]` carries defaults whether or not it is in use.
+    #[test]
+    fn validate_skips_sglake_checks_on_other_backends() {
+        let cfg = AppConfig::from_toml(
+            r#"
+            [[pipeline]]
+            name = "p"
+            [[pipeline.sources]]
+            type = "pcap"
+            interface = "eth0"
+
+            [storage]
+            backend = "clickhouse"
+
+            [storage.sglake]
+            index_prefix = ""
+            max_event_bytes = 1
+            "#,
+        );
+        assert!(
+            !cfg.validate().iter().any(|i| matches!(
+                i,
+                ConfigIssue::SglakeReservedIndexPrefix { .. }
+                    | ConfigIssue::SglakeEventCapBelowBodyCap { .. }
+            )),
+            "sglake issues leaked into a clickhouse config"
+        );
+    }
+
+    /// An empty prefix yields `_spans`, which sits in sglake's own
+    /// leading-underscore namespace.
+    #[test]
+    fn validate_rejects_unusable_sglake_index_prefix() {
+        for prefix in ["", "_hidden", "Heron", "he ron", "heron-1"] {
+            let cfg = AppConfig::from_toml(&format!(
+                r#"
+                [[pipeline]]
+                name = "p"
+                [[pipeline.sources]]
+                type = "pcap"
+                interface = "eth0"
+
+                [storage]
+                backend = "sglake"
+
+                [storage.sglake]
+                index_prefix = "{prefix}"
+                "#
+            ));
+            assert!(
+                cfg.validate()
+                    .iter()
+                    .any(|i| matches!(i, ConfigIssue::SglakeReservedIndexPrefix { .. })),
+                "accepted unusable prefix {prefix:?}"
+            );
+        }
+
+        // The default prefix, and other plain tokens, must pass.
+        for prefix in ["heron", "heron_prod", "h2"] {
+            let cfg = AppConfig::from_toml(&format!(
+                r#"
+                [[pipeline]]
+                name = "p"
+                [[pipeline.sources]]
+                type = "pcap"
+                interface = "eth0"
+
+                [storage]
+                backend = "sglake"
+
+                [storage.sglake]
+                index_prefix = "{prefix}"
+                "#
+            ));
+            assert!(
+                !cfg.validate()
+                    .iter()
+                    .any(|i| matches!(i, ConfigIssue::SglakeReservedIndexPrefix { .. })),
+                "rejected valid prefix {prefix:?}"
+            );
+        }
+    }
+
+    /// An event ceiling below the body cap drops every full-size body, every
+    /// time — silent steady-state data loss, so it has to be an error.
+    #[test]
+    fn validate_flags_event_cap_below_body_cap() {
+        let cfg = AppConfig::from_toml(
+            r#"
+            [[pipeline]]
+            name = "p"
+            [[pipeline.sources]]
+            type = "pcap"
+            interface = "eth0"
+
+            [storage]
+            backend = "sglake"
+
+            [storage.sglake]
+            max_event_bytes = 1024
+
+            [body_cap]
+            enabled = true
+            head_bytes = 262144
+            tail_bytes = 65536
+            "#,
+        );
+        let issue = cfg
+            .validate()
+            .into_iter()
+            .find(|i| matches!(i, ConfigIssue::SglakeEventCapBelowBodyCap { .. }))
+            .expect("expected the event-cap issue");
+        assert_eq!(issue.severity(), IssueSeverity::Error);
+        assert!(issue.to_string().contains("max_event_bytes"));
+
+        // Storing no bodies removes the constraint entirely.
+        let cfg = AppConfig::from_toml(
+            r#"
+            [[pipeline]]
+            name = "p"
+            [[pipeline.sources]]
+            type = "pcap"
+            interface = "eth0"
+
+            [storage]
+            backend = "sglake"
+
+            [storage.sglake]
+            max_event_bytes = 1024
+            store_bodies = false
+
+            [body_cap]
+            enabled = true
+            head_bytes = 262144
+            tail_bytes = 65536
+            "#,
+        );
+        assert!(!cfg
+            .validate()
+            .iter()
+            .any(|i| matches!(i, ConfigIssue::SglakeEventCapBelowBodyCap { .. })));
+    }
+
+    /// Bodies outliving their span metadata is wasteful but not broken, so it
+    /// warns rather than failing validation.
+    #[test]
+    fn validate_warns_on_orphaned_body_retention() {
+        let cfg = AppConfig::from_toml(
+            r#"
+            [[pipeline]]
+            name = "p"
+            [[pipeline.sources]]
+            type = "pcap"
+            interface = "eth0"
+
+            [storage]
+            backend = "sglake"
+
+            [storage.sglake]
+            body_retention_days = 90
+
+            [storage.retention]
+            spans = 7
+            traces = 7
+            "#,
+        );
+        let issue = cfg
+            .validate()
+            .into_iter()
+            .find(|i| matches!(i, ConfigIssue::SglakeBodyRetentionExceedsSpans { .. }))
+            .expect("expected the body-retention issue");
+        assert_eq!(issue.severity(), IssueSeverity::Warn);
+
+        // 0 means "inherit", which can never conflict.
+        let cfg = AppConfig::from_toml(
+            r#"
+            [[pipeline]]
+            name = "p"
+            [[pipeline.sources]]
+            type = "pcap"
+            interface = "eth0"
+
+            [storage]
+            backend = "sglake"
+
+            [storage.sglake]
+            body_retention_days = 0
+
+            [storage.retention]
+            spans = 7
+            traces = 7
+            "#,
+        );
+        assert!(!cfg
+            .validate()
+            .iter()
+            .any(|i| matches!(i, ConfigIssue::SglakeBodyRetentionExceedsSpans { .. })));
     }
 
     #[test]

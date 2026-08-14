@@ -14,10 +14,11 @@ use std::collections::HashMap;
 use h_common::error::Result;
 use h_common::process::ProcessInfo;
 use h_llm::model::LlmCall;
-use h_storage::query::{SpanDetail, TraceSpanItem};
+use h_storage::query::{SpanDetail, SpanListItem, SpansPage, SpansQuery, TraceSpanItem};
 
+use crate::read::Sort;
 use crate::rows::{span_events, BodyEvent, Envelope, SpanEvent, ST_BODY, ST_SPAN};
-use crate::spl::{in_list, match_term, ID_CHUNK};
+use crate::spl::{in_list, match_term, Search, ID_CHUNK};
 use crate::SglakeBackend;
 
 /// Microseconds → milliseconds, the unit the detail and trace-span types use.
@@ -25,6 +26,56 @@ use crate::SglakeBackend;
 pub(crate) fn ms(us: i64) -> i64 {
     us / 1000
 }
+
+/// Ceiling on the id set used to resolve the traces `server_port` filter.
+const PORT_FILTER_ID_CAP: usize = 50_000;
+
+fn span_list_item(e: SpanEvent) -> SpanListItem {
+    SpanListItem {
+        id: e.id,
+        source_id: e.source_id,
+        request_time: ms(e.ts_us),
+        wire_api: e.wire_api,
+        model: e.model,
+        status_code: e.status_code,
+        is_stream: e.is_stream,
+        finish_reason: e.finish_reason,
+        ttft_ms: e.ttft_ms,
+        e2e_latency_ms: e.e2e_latency_ms,
+        input_tokens: e.input_tokens,
+        output_tokens: e.output_tokens,
+        // Stored, not derived: the SQL backends compute this from
+        // `response_body`, which means the list query has to read bodies it
+        // otherwise never touches. Here they live in a different index.
+        tokens_estimated: e.tokens_estimated,
+        client_ip: e.client_ip,
+        server_ip: e.server_ip,
+        server_port: e.server_port,
+        request_path: e.request_path,
+        is_agent_request: e.is_agent_request,
+        tool_surface: e.tool_surface,
+        agent_topology: e.agent_topology,
+        tool_call_count: e.tool_call_count,
+        tool_names: h_storage::convert::parse_json_string_list(Some(&e.tool_names_json)),
+        process: e.process_pid.map(|pid| ProcessInfo {
+            pid,
+            comm: e.process_comm.clone().unwrap_or_default(),
+            exe: e.process_exe.clone(),
+        }),
+    }
+}
+
+/// `sort_by` values the API may send, and the SPL key each maps to. `num()`
+/// is required because extracted field values are strings; without it the
+/// comparison would be lexicographic and `9` would sort after `100`.
+const SPAN_SORT: &[(&str, &str)] = &[
+    ("request_time", "num(ts_us)"),
+    ("status_code", "num(status_code)"),
+    ("ttft_ms", "num(ttft_ms)"),
+    ("e2e_latency_ms", "num(e2e_latency_ms)"),
+    ("input_tokens", "num(input_tokens)"),
+    ("output_tokens", "num(output_tokens)"),
+];
 
 impl SglakeBackend {
     pub(crate) async fn write_spans(&self, calls: Vec<LlmCall>) -> Result<()> {
@@ -60,6 +111,53 @@ impl SglakeBackend {
             }
         }
         self.hec.send(events).await
+    }
+
+    pub(crate) async fn query_spans(&self, query: &SpansQuery) -> Result<SpansPage> {
+        let sort = Sort::new(
+            &query.sort_by,
+            &query.sort_order,
+            SPAN_SORT,
+            &["num(ts_us)", "str(id)"],
+        )?;
+
+        let mut s = Search::new(&self.ix.spans, ST_SPAN);
+        s.any_of("wire_api", &query.filter.wire_apis);
+        s.any_of("model", &query.filter.models);
+        s.any_of("server_ip", &query.filter.server_ips);
+        s.any_of("client_ip", &query.client_ips);
+        s.any_of("finish_reason", &query.finish_reasons);
+        s.any_of_nums("status_code", &query.status_codes);
+        s.any_of_nums("server_port", &query.server_ports);
+        if let Some(sub) = query
+            .request_path_contains
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            s.contains("request_path", sub);
+        }
+        if let Some(stream) = query.is_stream {
+            // The 0/1 twin, not the boolean: an exact posting rather than a
+            // match against the string "true".
+            s.eq_num("strm", u8::from(stream));
+        }
+
+        let (events, total) = self
+            .fetch_page::<SpanEvent>(
+                "query_spans",
+                &s,
+                &sort,
+                query.page,
+                query.page_size,
+                &query.time_range,
+            )
+            .await?;
+
+        Ok(SpansPage {
+            total,
+            items: events.into_iter().map(span_list_item).collect(),
+        })
     }
 
     pub(crate) async fn query_span_by_id(&self, id: &str) -> Result<Option<SpanDetail>> {
@@ -233,6 +331,45 @@ impl SglakeBackend {
                     response_headers: b.response_headers,
                 }
             })
+            .collect())
+    }
+
+    /// Resolve span ids for a set of server ports — the indirection
+    /// `query_traces` needs, since a trace carries no port of its own.
+    ///
+    /// Bounded on purpose. Ports are low-cardinality, so this filter is
+    /// usually barely selective and the id set can be enormous; past the cap
+    /// there is no honest answer to give, and a truncated one would look like
+    /// a complete page. See the crate docs.
+    pub(crate) async fn span_ids_on_ports(
+        &self,
+        ports: &[u16],
+        range: &h_storage::query::TimeRange,
+    ) -> Result<Vec<String>> {
+        let mut s = Search::new(&self.ix.spans, ST_SPAN);
+        s.any_of_nums("server_port", ports);
+        let limit = PORT_FILTER_ID_CAP + 1;
+        let spl = format!("{} | head {limit} | table id", s.build());
+        let rows = self
+            .search
+            .search(
+                &spl,
+                &crate::spl::epoch_secs(range.start_us),
+                &crate::spl::epoch_secs(range.end_us),
+            )
+            .await?
+            .rows();
+        if rows.len() > PORT_FILTER_ID_CAP {
+            return Err(h_common::error::AppError::Storage(format!(
+                "sglake backend: the server_port filter on traces matches more \
+                 than {PORT_FILTER_ID_CAP} calls in this window. A trace stores \
+                 no port of its own, so the filter is resolved through its \
+                 calls; narrow the time range or drop the port filter."
+            )));
+        }
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| r.get("id").and_then(|v| v.as_str()).map(str::to_string))
             .collect())
     }
 

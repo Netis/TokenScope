@@ -36,6 +36,7 @@ use h_metrics::model::LlmFinishMetric;
 use h_protocol::model::{HttpRequestData, HttpResponseData};
 use h_protocol::net::FlowKey;
 use h_protocol::HttpExchange;
+use h_storage::query::*;
 use h_storage::StorageBackend;
 
 use crate::rows::fixtures;
@@ -371,10 +372,11 @@ async fn http_exchange_round_trips_with_microsecond_times() {
     assert_eq!(got.server_port, 443);
     assert!(!got.is_sse);
     assert_eq!(got.sse_event_count, 0);
-    // The one read that keeps microseconds rather than milliseconds.
-    assert_eq!(got.request_time, ts);
-    assert_eq!(got.response_first_byte_time, Some(ts + 500_000));
-    assert_eq!(got.response_complete_time, Some(ts + 1_000_000));
+    // Milliseconds, matching DuckDB. ClickHouse returns microseconds for this
+    // one read and is the outlier — see the exchanges module docs.
+    assert_eq!(got.request_time, ts / 1000);
+    assert_eq!(got.response_first_byte_time, Some((ts + 500_000) / 1000));
+    assert_eq!(got.response_complete_time, Some((ts + 1_000_000) / 1000));
     assert!(got.request_headers.contains("application/json"));
     assert!(got.response_headers.contains("req_abc"));
     assert_eq!(got.request_body.as_deref(), Some(r#"{"model":"gpt-4"}"#));
@@ -438,4 +440,529 @@ async fn empty_writes_are_no_ops() {
         .await
         .unwrap()
         .is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2: lists + pagination
+// ---------------------------------------------------------------------------
+
+fn spans_query(page: u32, page_size: u32) -> SpansQuery {
+    SpansQuery {
+        time_range: TimeRange {
+            start_us: 0,
+            end_us: 4_000_000_000_000_000,
+        },
+        filter: DimensionFilter::default(),
+        status_codes: vec![],
+        finish_reasons: vec![],
+        client_ips: vec![],
+        server_ports: vec![],
+        request_path_contains: None,
+        is_stream: None,
+        sort_by: "request_time".into(),
+        sort_order: "DESC".into(),
+        page,
+        page_size,
+    }
+}
+
+/// The test that would catch a broken pagination scheme: walk every page and
+/// assert the union is exactly the full set, with nothing repeated and nothing
+/// dropped. Unstable ordering, an off-by-one in the `sort N | tail L` window,
+/// or a wrong `total` all show up here and nowhere else.
+#[tokio::test]
+async fn paging_covers_every_row_exactly_once() {
+    let backend = require_backend!();
+    let base = 1_785_638_000_000_000_i64;
+    const N: usize = 23;
+
+    let mut calls = Vec::new();
+    for i in 0..N {
+        let mut c = fixtures::full_call();
+        c.id = format!("page-{i:03}");
+        // Two spans deliberately share a microsecond, so the run also proves
+        // the tie-break gives a total order.
+        c.request_time = base + (i as i64 / 2) * 1_000_000;
+        calls.push(c);
+    }
+    backend.write_spans(calls).await.unwrap();
+
+    eventually("all spans", || async {
+        let p = backend.query_spans(&spans_query(1, 100)).await.unwrap();
+        (p.total == N as u64).then_some(p)
+    })
+    .await;
+
+    for page_size in [1u32, 7, 200] {
+        let mut seen: Vec<String> = Vec::new();
+        let mut page = 1u32;
+        loop {
+            let p = backend
+                .query_spans(&spans_query(page, page_size))
+                .await
+                .unwrap();
+            assert_eq!(p.total, N as u64, "total must not drift between pages");
+            if p.items.is_empty() {
+                break;
+            }
+            assert!(
+                p.items.len() <= page_size as usize,
+                "page {page} returned {} rows for page_size {page_size}",
+                p.items.len()
+            );
+            seen.extend(p.items.iter().map(|i| i.id.clone()));
+            page += 1;
+            assert!(page < 100, "pagination did not terminate");
+        }
+        let mut unique = seen.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            seen.len(),
+            "page_size {page_size} repeated rows across pages"
+        );
+        assert_eq!(
+            unique.len(),
+            N,
+            "page_size {page_size} lost rows: got {} of {N}",
+            unique.len()
+        );
+    }
+}
+
+#[tokio::test]
+async fn span_filters_narrow_the_result_and_the_total() {
+    let backend = require_backend!();
+    let base = 1_785_639_000_000_000_i64;
+    let mut calls = Vec::new();
+    for (i, (model, status, stream)) in [
+        ("gpt-4", 200u16, true),
+        ("gpt-4", 404, false),
+        ("claude-sonnet", 200, true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut c = fixtures::full_call();
+        c.id = format!("filt-{i}");
+        c.request_time = base + i as i64 * 1_000_000;
+        c.model = model.into();
+        c.status_code = Some(status);
+        c.is_stream = stream;
+        c.request_path = format!("/v1/{}/completions", if stream { "chat" } else { "embed" });
+        calls.push(c);
+    }
+    backend.write_spans(calls).await.unwrap();
+    eventually("filter fixture", || async {
+        let p = backend.query_spans(&spans_query(1, 50)).await.unwrap();
+        (p.total == 3).then_some(p)
+    })
+    .await;
+
+    let backend = &backend;
+    let run = move |mutate: fn(&mut SpansQuery)| async move {
+        let mut q = spans_query(1, 50);
+        mutate(&mut q);
+        backend.query_spans(&q).await.unwrap()
+    };
+
+    let p = run(|q| q.filter.models = vec!["gpt-4".into()]).await;
+    assert_eq!(p.total, 2);
+    assert_eq!(p.items.len(), 2);
+
+    let p = run(|q| q.status_codes = vec![404]).await;
+    assert_eq!(p.total, 1);
+    assert_eq!(p.items[0].id, "filt-1");
+
+    let p = run(|q| q.is_stream = Some(false)).await;
+    assert_eq!(p.total, 1);
+    assert_eq!(p.items[0].id, "filt-1");
+
+    let p = run(|q| q.request_path_contains = Some("chat".into())).await;
+    assert_eq!(p.total, 2);
+
+    // A filter matching nothing must give an empty page, not everything.
+    let p = run(|q| q.filter.models = vec!["no-such-model".into()]).await;
+    assert_eq!(p.total, 0);
+    assert!(p.items.is_empty());
+
+    // An empty filter list means "no filter" — the trap that silently blanks
+    // every page if it is treated as "match nothing".
+    let p = run(|q| q.filter.models = vec![]).await;
+    assert_eq!(p.total, 3);
+}
+
+/// A model name containing `*` must be compared literally. Under a search
+/// term it would become a glob and match the other rows too.
+#[tokio::test]
+async fn wildcard_in_a_filter_value_matches_literally() {
+    let backend = require_backend!();
+    let base = 1_785_640_000_000_000_i64;
+    let mut calls = Vec::new();
+    for (i, model) in ["weird*name", "weirdXname", "other"]
+        .into_iter()
+        .enumerate()
+    {
+        let mut c = fixtures::full_call();
+        c.id = format!("glob-{i}");
+        c.request_time = base + i as i64 * 1_000_000;
+        c.model = model.into();
+        calls.push(c);
+    }
+    backend.write_spans(calls).await.unwrap();
+    eventually("glob fixture", || async {
+        let p = backend.query_spans(&spans_query(1, 50)).await.unwrap();
+        (p.total == 3).then_some(p)
+    })
+    .await;
+
+    let mut q = spans_query(1, 50);
+    q.filter.models = vec!["weird*name".into()];
+    let p = backend.query_spans(&q).await.unwrap();
+    assert_eq!(p.total, 1, "`*` must not act as a wildcard");
+    assert_eq!(p.items[0].model, "weird*name");
+}
+
+#[tokio::test]
+async fn invalid_sort_and_deep_offset_are_refused() {
+    let backend = require_backend!();
+
+    let mut q = spans_query(1, 10);
+    q.sort_by = "id; drop".into();
+    assert!(
+        backend.query_spans(&q).await.is_err(),
+        "sort_by is whitelisted"
+    );
+
+    // Deep offset costs offset+limit rows to return limit of them; past the
+    // configured ceiling that is refused rather than run.
+    let mut q = spans_query(u32::MAX, 100);
+    q.sort_by = "request_time".into();
+    let err = backend.query_spans(&q).await.unwrap_err().to_string();
+    assert!(err.contains("max_page_offset"), "{err}");
+}
+
+#[tokio::test]
+async fn traces_list_hides_folded_proxy_hops_unless_asked() {
+    let backend = require_backend!();
+    let base = 1_785_641_000_000_000_i64;
+    let mut traces = Vec::new();
+    for (i, role) in [None, Some("proxy_in"), Some("proxy_out")]
+        .into_iter()
+        .enumerate()
+    {
+        let mut t = fixtures::full_trace();
+        t.turn_id = format!("hop-{i}-{}", uuid::Uuid::now_v7());
+        t.session_id = "hops".into();
+        t.start_time_us = base + i as i64 * 1_000_000;
+        t.end_time_us = t.start_time_us + 500_000;
+        t.metadata = match role {
+            Some(r) => serde_json::json!({ "proxy": { "role": r, "pair_id": "g1" } }),
+            None => serde_json::json!({}),
+        };
+        traces.push(t);
+    }
+    backend.write_traces(traces.clone()).await.unwrap();
+
+    let q = |include: bool| TracesQuery {
+        time_range: TimeRange {
+            start_us: base - 1_000_000,
+            end_us: base + 60_000_000,
+        },
+        filter: DimensionFilter::default(),
+        client_ips: vec![],
+        server_ports: vec![],
+        statuses: vec![],
+        agent_kinds: vec![],
+        sort_by: "start_time".into(),
+        sort_order: "DESC".into(),
+        page: 1,
+        page_size: 50,
+        include_proxy_hops: include,
+    };
+
+    let all = eventually("traces", || async {
+        let p = backend.query_traces(&q(true)).await.unwrap();
+        (p.total == 3).then_some(p)
+    })
+    .await;
+    assert_eq!(all.items.len(), 3);
+
+    // `proxy_out` is folded away by default; the other two stay.
+    let visible = backend.query_traces(&q(false)).await.unwrap();
+    assert_eq!(visible.total, 2);
+    assert!(visible
+        .items
+        .iter()
+        .all(|i| i.proxy_role.as_deref() != Some("proxy_out")));
+    // The direct turn has no proxy role at all and must survive the filter —
+    // the case a naive `role NOT IN (...)` would drop.
+    assert!(visible.items.iter().any(|i| i.proxy_role.is_none()));
+}
+
+#[tokio::test]
+async fn exchanges_list_paginates_and_reports_duration() {
+    let backend = require_backend!();
+    let base = 1_785_642_000_000_000_i64;
+    let mut xs = Vec::new();
+    for i in 0..5 {
+        xs.push(sample_exchange(
+            &format!("x-{i}-{}", uuid::Uuid::now_v7()),
+            base + i * 1_000_000,
+        ));
+    }
+    backend.write_exchanges(xs).await.unwrap();
+
+    let q = |page: u32, page_size: u32| HttpExchangesQuery {
+        time_range: TimeRange {
+            start_us: base - 1_000_000,
+            end_us: base + 60_000_000,
+        },
+        server_ips: vec![],
+        client_ips: vec![],
+        methods: vec![],
+        status_codes: vec![],
+        uri_contains: None,
+        is_sse: None,
+        sort_by: "request_time".into(),
+        sort_order: "DESC".into(),
+        page,
+        page_size,
+    };
+
+    let p = eventually("exchanges", || async {
+        let p = backend.query_http_exchanges(&q(1, 50)).await.unwrap();
+        (p.total == 5).then_some(p)
+    })
+    .await;
+    // Milliseconds, matching DuckDB — see the exchanges module docs.
+    assert_eq!(p.items[0].request_time, (base + 4_000_000) / 1000);
+    assert_eq!(p.items[0].duration_ms, Some(1000.0));
+    assert_eq!(p.items[0].method, "POST");
+
+    // Sorting on the eval-derived duration must not drop rows.
+    let mut sorted = q(1, 50);
+    sorted.sort_by = "duration_ms".into();
+    assert_eq!(
+        backend.query_http_exchanges(&sorted).await.unwrap().total,
+        5
+    );
+
+    // Paging the list covers everything exactly once.
+    let mut seen = Vec::new();
+    for page in 1..=3 {
+        seen.extend(
+            backend
+                .query_http_exchanges(&q(page, 2))
+                .await
+                .unwrap()
+                .items
+                .into_iter()
+                .map(|i| i.id),
+        );
+    }
+    seen.sort();
+    seen.dedup();
+    assert_eq!(seen.len(), 5);
+
+    let mut filtered = q(1, 50);
+    filtered.uri_contains = Some("chat".into());
+    assert_eq!(
+        backend.query_http_exchanges(&filtered).await.unwrap().total,
+        5
+    );
+    filtered.uri_contains = Some("nope".into());
+    assert_eq!(
+        backend.query_http_exchanges(&filtered).await.unwrap().total,
+        0
+    );
+}
+
+/// Sessions aggregate over a session's **whole life** but are selected by the
+/// requested window — the distinction this test exists to pin down.
+#[tokio::test]
+async fn sessions_aggregate_full_lifetime_but_select_by_window() {
+    let backend = require_backend!();
+    let base = 1_785_643_000_000_000_i64;
+    let sec = |n: i64| base + n * 1_000_000;
+
+    let mk = |turn: &str, session: &str, start: i64, preview: Option<&str>| {
+        let mut t = fixtures::full_trace();
+        t.turn_id = turn.to_string();
+        t.session_id = session.to_string();
+        t.start_time_us = start;
+        t.end_time_us = start + 500_000;
+        t.call_count = 2;
+        t.total_input_tokens = 100;
+        t.total_cost_usd = Some(0.5);
+        t.user_input_preview = preview.map(String::from);
+        t.user_call_id = preview.map(|_| format!("call-{turn}"));
+        t.metadata = serde_json::json!({});
+        t
+    };
+
+    backend
+        .write_traces(vec![
+            // S1: one turn far outside the window, one inside.
+            mk("s1-early", "S1", sec(10), Some("opening S1")),
+            mk("s1-late", "S1", sec(50), None),
+            // S2: both inside.
+            mk("s2-a", "S2", sec(45), Some("opening S2")),
+            mk("s2-b", "S2", sec(46), None),
+            // S3: entirely outside.
+            mk("s3", "S3", sec(500), Some("opening S3")),
+        ])
+        .await
+        .unwrap();
+
+    let q = |cursor: Option<SessionListCursor>, page_size: u32| SessionListQuery {
+        time_range: TimeRange {
+            start_us: sec(40),
+            end_us: sec(60),
+        },
+        source_id: None,
+        agent_kinds: vec![],
+        cursor,
+        page_size,
+    };
+
+    let page = eventually("sessions", || async {
+        let p = backend.query_sessions(&q(None, 10)).await.unwrap();
+        (p.items.len() == 2).then_some(p)
+    })
+    .await;
+
+    // S1's in-window turn ends latest, so it sorts first.
+    assert_eq!(page.items[0].session_id, "S1");
+    assert_eq!(page.items[1].session_id, "S2");
+    // Lifetime aggregates: both of S1's turns count, including the one
+    // outside the window.
+    assert_eq!(page.items[0].turn_count, 2);
+    assert_eq!(page.items[0].call_count, 4);
+    assert_eq!(page.items[0].total_input_tokens, 200);
+    assert_eq!(page.items[0].total_cost_usd, Some(1.0));
+    // …and first_turn_at is the lifetime minimum, not the in-window one.
+    assert_eq!(page.items[0].first_turn_at, sec(10) / 1000);
+    assert_eq!(
+        page.items[0].last_turn_at_in_window,
+        (sec(50) + 500_000) / 1000
+    );
+    // The preview comes from the earliest turn of the session.
+    assert_eq!(
+        page.items[0].first_user_input_preview.as_deref(),
+        Some("opening S1")
+    );
+    assert_eq!(
+        page.items[0].first_user_call_id.as_deref(),
+        Some("call-s1-early")
+    );
+    assert!(page.items.iter().all(|i| i.session_id != "S3"));
+    assert!(page.next_cursor.is_none(), "last page has no cursor");
+
+    // Cursor paging one at a time must visit each session exactly once.
+    let mut seen = Vec::new();
+    let mut cursor = None;
+    loop {
+        let p = backend.query_sessions(&q(cursor, 1)).await.unwrap();
+        if p.items.is_empty() {
+            break;
+        }
+        seen.extend(p.items.iter().map(|i| i.session_id.clone()));
+        match p.next_cursor {
+            Some(c) => cursor = decode_session_cursor(&c),
+            None => break,
+        }
+        assert!(seen.len() < 10, "cursor paging did not terminate");
+    }
+    assert_eq!(seen, vec!["S1".to_string(), "S2".to_string()]);
+
+    // by-id returns the same lifetime aggregate.
+    let detail = backend
+        .query_session_by_id(&page.items[0].source_id, "S1")
+        .await
+        .unwrap()
+        .expect("session exists");
+    assert_eq!(detail.turn_count, 2);
+    assert_eq!(detail.call_count, 4);
+    assert_eq!(detail.total_input_tokens, 200);
+    assert_eq!(detail.first_turn_at, sec(10) / 1000);
+    assert_eq!(
+        detail.first_user_input_preview.as_deref(),
+        Some("opening S1")
+    );
+
+    assert!(backend
+        .query_session_by_id("src-0", "no-such-session")
+        .await
+        .unwrap()
+        .is_none());
+
+    // The session's turns, newest first, paged by cursor.
+    let mut turns = Vec::new();
+    let mut cursor = None;
+    loop {
+        let p = backend
+            .query_session_traces(&SessionTracesQuery {
+                source_id: page.items[0].source_id.clone(),
+                session_id: "S1".into(),
+                cursor,
+                page_size: 1,
+            })
+            .await
+            .unwrap();
+        if p.items.is_empty() {
+            break;
+        }
+        turns.extend(p.items.iter().map(|t| t.turn_id.clone()));
+        match p.next_cursor {
+            Some(c) => cursor = decode_session_turns_cursor(&c),
+            None => break,
+        }
+        assert!(turns.len() < 10, "turn paging did not terminate");
+    }
+    assert_eq!(turns, vec!["s1-late".to_string(), "s1-early".to_string()]);
+}
+
+#[tokio::test]
+async fn session_filters_apply_before_aggregation() {
+    let backend = require_backend!();
+    let base = 1_785_644_000_000_000_i64;
+    let mut a = fixtures::full_trace();
+    a.turn_id = format!("ak-a-{}", uuid::Uuid::now_v7());
+    a.session_id = "AK1".into();
+    a.agent_kind = "claude-cli".into();
+    a.start_time_us = base;
+    a.end_time_us = base + 100_000;
+    a.metadata = serde_json::json!({});
+    let mut b = a.clone();
+    b.turn_id = format!("ak-b-{}", uuid::Uuid::now_v7());
+    b.session_id = "AK2".into();
+    b.agent_kind = "codex-cli".into();
+    backend.write_traces(vec![a, b]).await.unwrap();
+
+    let q = |kinds: Vec<String>| SessionListQuery {
+        time_range: TimeRange {
+            start_us: base - 1_000_000,
+            end_us: base + 60_000_000,
+        },
+        source_id: None,
+        agent_kinds: kinds,
+        cursor: None,
+        page_size: 10,
+    };
+
+    eventually("agent-kind sessions", || async {
+        let p = backend.query_sessions(&q(vec![])).await.unwrap();
+        (p.items.len() == 2).then_some(p)
+    })
+    .await;
+
+    let p = backend
+        .query_sessions(&q(vec!["codex-cli".into()]))
+        .await
+        .unwrap();
+    assert_eq!(p.items.len(), 1);
+    assert_eq!(p.items[0].session_id, "AK2");
+    assert_eq!(p.items[0].agent_kind, "codex-cli");
 }

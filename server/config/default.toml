@@ -110,8 +110,9 @@
 # Storage
 # ---------------------------------------------------------------------------
 [storage]
-# Pluggable storage backend: "duckdb" (default, embedded single-node / edge)
-# or "clickhouse" (dedicated server for large-scale, high-throughput analytics).
+# Pluggable storage backend: "duckdb" (default, embedded single-node / edge),
+# "clickhouse" (dedicated server for large-scale, high-throughput analytics),
+# or "sglake" (Splunk-compatible log platform; full-text searchable bodies).
 backend = "duckdb"
 
 [storage.duckdb]
@@ -127,6 +128,44 @@ path = "data/heron.duckdb"
 # user              = "default"
 # password          = ""
 # optimize_on_sweep = false   # OPTIMIZE TABLE ... FINAL after each retention sweep
+
+# sglake / sglog backend (used only when backend = "sglake"). Writes go over
+# the HTTP Event Collector, reads are SPL. Indexes are created on first write —
+# there is nothing to provision. Unlike the SQL backends, stored bodies are
+# full-text searchable (`search index=heron_bodies "SELECT * FROM users"`).
+#
+# Two things about the sglogd side that Heron cannot set for you:
+#   * Start sglogd with --max-hot-raw-mib 2048 (or more). The 64 MiB default
+#     produces one bucket per few hundred spans, and search cost scales with
+#     bucket count.
+#   * `heron sglake-props` prints the props.toml stanzas that make aggregate
+#     queries read columns instead of decompressing bodies. Queries stay
+#     correct without them, just far slower. Index-time settings do not apply
+#     retroactively, so merge them before ingesting in earnest.
+#
+# The /api/v1/* endpoints are unauthenticated in sglogd — bind it to loopback
+# or otherwise restrict it at the network layer.
+# [storage.sglake]
+# url                    = "http://127.0.0.1:5959"
+# hec_token              = ""        # matched as `Authorization: Splunk <token>`
+# index_prefix           = "heron"   # owns <prefix>_spans, _bodies, _traces, ...
+# store_bodies           = true      # false keeps metadata only (~2.7% of the footprint)
+# body_retention_days    = 0         # 0 inherits storage.retention.spans
+# manage_retention       = true      # push per-index retention on the shared schedule
+# max_body_bytes         = 33554432  # per HEC request, pre-compression
+# max_event_bytes        = 8388608   # per event; must stay under sglake's 16 MiB WAL frame
+# gzip                   = true
+# use_ack                = false
+# write_retries          = 3
+# retry_backoff_ms       = 250
+# request_timeout_secs   = 30
+# search_timeout_secs    = 60
+# max_page_offset        = 100000    # deep paging errors out rather than running for minutes
+# max_sessions_scan      = 200000
+# max_concurrent_searches = 8
+# trace_time_skew_hours  = 6         # widens end-time windows; a trace's _time is its start
+# metrics_dedup          = false     # only needed if duplicate metric rows are observed
+# enable_trace_patching  = false     # see the backend docs: costs a full-window sort on traces reads
 
 # Storage sink batching. flush_interval_ms is the upper bound on how long a
 # single LlmCall / AgentTurn / metric row can sit in the in-memory buffer

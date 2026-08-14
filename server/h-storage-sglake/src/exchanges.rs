@@ -4,17 +4,40 @@
 //! metadata event precedes its body event in the batch, so a partial ingest
 //! can lose a body but never orphan one.
 //!
-//! Unlike every other read here, `HttpExchangeDetail` carries **microsecond**
-//! timestamps rather than milliseconds — the raw HTTP view is where sub-ms
-//! timing is the point.
+//! # Timestamp units: matching DuckDB, not ClickHouse
+//!
+//! The two SQL backends disagree about this entity. `HttpExchangeDetail`'s doc
+//! comment says microseconds; DuckDB emits **milliseconds** (`epoch_ms`) and
+//! ClickHouse emits **microseconds** (`toUnixTimestamp64Micro`), so the same
+//! API endpoint returns values 1000× apart depending on which backend is
+//! configured. For the list type they agree on milliseconds, despite its doc
+//! comment also saying microseconds.
+//!
+//! This backend follows DuckDB — milliseconds everywhere — because DuckDB is
+//! the default and what the console renders against; emitting microseconds
+//! would date every request to the year 58000 in the UI. That makes sglake
+//! self-consistent and consistent with the default backend, and leaves
+//! ClickHouse's detail read as the outlier to fix separately.
 
 use h_common::error::Result;
 use h_protocol::HttpExchange;
-use h_storage::query::HttpExchangeDetail;
+use h_storage::query::{
+    HttpExchangeDetail, HttpExchangeListItem, HttpExchangesPage, HttpExchangesQuery,
+};
 
+use crate::calls::ms;
+use crate::read::Sort;
 use crate::rows::{http_events, Envelope, HttpBodyEvent, HttpEvent, ST_HTTP, ST_HTTP_BODY};
-use crate::spl::match_term;
+use crate::spl::{match_term, Search};
 use crate::SglakeBackend;
+
+/// `duration_ms` is not stored — it is `done_us - ts_us`, computed by an
+/// `| eval` stage before the sort so it can be sorted on.
+const EXCHANGE_SORT: &[(&str, &str)] = &[
+    ("request_time", "num(ts_us)"),
+    ("status", "num(status)"),
+    ("duration_ms", "num(dur_ms)"),
+];
 
 impl SglakeBackend {
     pub(crate) async fn write_exchanges(&self, exchanges: Vec<HttpExchange>) -> Result<()> {
@@ -54,6 +77,52 @@ impl SglakeBackend {
             }
         }
         self.hec.send(events).await
+    }
+
+    pub(crate) async fn query_http_exchanges(
+        &self,
+        query: &HttpExchangesQuery,
+    ) -> Result<HttpExchangesPage> {
+        let sort = Sort::new(
+            &query.sort_by,
+            &query.sort_order,
+            EXCHANGE_SORT,
+            &["num(ts_us)", "str(id)"],
+        )?;
+
+        let mut s = Search::new(&self.ix.http, ST_HTTP);
+        s.any_of("server_ip", &query.server_ips);
+        s.any_of("client_ip", &query.client_ips);
+        s.any_of("method", &query.methods);
+        s.any_of_nums("status", &query.status_codes);
+        if let Some(sub) = query
+            .uri_contains
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            s.contains("uri", sub);
+        }
+        if let Some(sse) = query.is_sse {
+            s.eq_num("sse", u8::from(sse));
+        }
+        s.eval("dur_ms", "(done_us - ts_us) / 1000");
+
+        let (events, total) = self
+            .fetch_page::<HttpEvent>(
+                "query_http_exchanges",
+                &s,
+                &sort,
+                query.page,
+                query.page_size,
+                &query.time_range,
+            )
+            .await?;
+
+        Ok(HttpExchangesPage {
+            total,
+            items: events.into_iter().map(exchange_list_item).collect(),
+        })
     }
 
     pub(crate) async fn query_http_exchange_by_id(
@@ -116,9 +185,27 @@ impl SglakeBackend {
             is_sse: e.is_sse,
             sse_event_count: e.sse_event_count,
             sse_data_bytes: e.sse_data_bytes,
-            request_time: e.ts_us,
-            response_first_byte_time: e.first_byte_us,
-            response_complete_time: e.done_us,
+            request_time: ms(e.ts_us),
+            response_first_byte_time: e.first_byte_us.map(ms),
+            response_complete_time: e.done_us.map(ms),
         }))
+    }
+}
+
+fn exchange_list_item(e: HttpEvent) -> HttpExchangeListItem {
+    HttpExchangeListItem {
+        id: e.id,
+        source_id: e.source_id,
+        request_time: ms(e.ts_us),
+        method: e.method,
+        uri: e.uri,
+        client_ip: e.client_ip,
+        server_ip: e.server_ip,
+        server_port: e.server_port,
+        status: e.status,
+        is_sse: e.is_sse,
+        // `None` for an exchange with no completion, matching the SQL
+        // backends' NULL for the same case.
+        duration_ms: e.done_us.map(|d| (d - e.ts_us) as f64 / 1000.0),
     }
 }
