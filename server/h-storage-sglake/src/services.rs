@@ -654,7 +654,7 @@ mod tests {
     fn unknown_callers_become_client_edges() {
         let nodes = vec![node("10.0.0.1", 8000, Some("vllm"), 10)];
         let mut entry = HashMap::new();
-        entry.insert(("192.168.1.5".into(), "10.0.0.1".into(), 8000u16), 3u64);
+        entry.insert(("203.0.113.5".into(), "10.0.0.1".into(), 8000u16), 3u64);
         let edges = assemble_edges(&nodes, entry, vec![]);
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0].kind, "client");

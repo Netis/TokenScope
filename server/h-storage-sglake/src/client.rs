@@ -652,3 +652,335 @@ mod tests {
         assert!(empty.rows().is_empty());
     }
 }
+
+// ---------------------------------------------------------------------------
+// Retry state machine
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::{SocketAddr, TcpListener};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    /// What the mock should do with one request.
+    #[derive(Clone)]
+    enum Reply {
+        Status(u16, &'static str),
+        /// Accept the request and never answer, so the client times out.
+        Hang,
+    }
+
+    /// A scripted HEC server on a real socket.
+    ///
+    /// The retry rules are the durability contract — `WriteBuffer` discards a
+    /// batch whose flush returns `Err`, so a wrong branch here is a silently
+    /// lost write or a duplicated one. They are also the part of this backend
+    /// least reachable from a live server: getting sglogd to emit a 413, or to
+    /// accept a request and then vanish, is not something a test can ask it
+    /// for. Scripting the responses is the only way to walk every branch.
+    struct MockHec {
+        addr: SocketAddr,
+        /// One entry per request received: `(path, body)`.
+        seen: Arc<Mutex<Vec<(String, String)>>>,
+    }
+
+    impl MockHec {
+        fn start(script: Vec<Reply>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            let addr = listener.local_addr().unwrap();
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let seen_bg = Arc::clone(&seen);
+            let next = Arc::new(AtomicUsize::new(0));
+
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { break };
+                    // One thread per connection. A single-threaded accept loop
+                    // would leave the retry's connection sitting in the backlog
+                    // while `Hang` sleeps on the previous one, and the test
+                    // would conclude no retry was attempted.
+                    let seen_bg = Arc::clone(&seen_bg);
+                    let next = Arc::clone(&next);
+                    let script = script.clone();
+                    std::thread::spawn(move || {
+                        let mut reader = BufReader::new(stream.try_clone().unwrap());
+
+                        let mut request_line = String::new();
+                        if reader.read_line(&mut request_line).is_err() {
+                            return;
+                        }
+                        let path = request_line
+                            .split_whitespace()
+                            .nth(1)
+                            .unwrap_or_default()
+                            .to_string();
+
+                        let mut len = 0usize;
+                        loop {
+                            let mut line = String::new();
+                            if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
+                                break;
+                            }
+                            if let Some(v) =
+                                line.to_ascii_lowercase().strip_prefix("content-length:")
+                            {
+                                len = v.trim().parse().unwrap_or(0);
+                            }
+                        }
+                        let mut body = vec![0u8; len];
+                        let _ = reader.read_exact(&mut body);
+                        let body = String::from_utf8_lossy(&body).to_string();
+
+                        // Ack queries are bookkeeping, not part of the script.
+                        if path.starts_with("/services/collector/ack") {
+                            let body = r#"{"acks":{"0":false}}"#;
+                            let _ = stream.write_all(
+                                format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                                 Content-Length: {}\r\n\r\n{body}",
+                                    body.len()
+                                )
+                                .as_bytes(),
+                            );
+                            return;
+                        }
+
+                        seen_bg.lock().unwrap().push((path, body));
+                        let i = next.fetch_add(1, Ordering::SeqCst);
+                        let reply = script
+                            .get(i)
+                            .cloned()
+                            .unwrap_or(Reply::Status(200, r#"{"text":"Success","code":0}"#));
+                        match reply {
+                            Reply::Hang => {
+                                // Hold the socket open, answering nothing.
+                                std::thread::sleep(std::time::Duration::from_secs(30));
+                            }
+                            Reply::Status(code, body) => {
+                                let _ = stream.write_all(
+                                    format!(
+                                        "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\n\
+                                     Content-Length: {}\r\n\r\n{body}",
+                                        body.len()
+                                    )
+                                    .as_bytes(),
+                                );
+                            }
+                        }
+                    });
+                }
+            });
+            Self { addr, seen }
+        }
+
+        fn requests(&self) -> Vec<(String, String)> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    fn client(mock: &MockHec, retries: u32) -> HecClient {
+        HecClient::new(&SglakeConfig {
+            url: format!("http://{}", mock.addr),
+            hec_token: "t".into(),
+            write_retries: retries,
+            retry_backoff_ms: 1,
+            request_timeout_secs: 1,
+            // Off so a request body is comparable to what was sent.
+            gzip: false,
+            // The ack path has its own tests; keep these on the plain branch.
+            use_ack: false,
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    fn events(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!(r#"{{"event":{i}}}"#)).collect()
+    }
+
+    /// 200 means fsynced. Resending would duplicate for no reason.
+    #[tokio::test]
+    async fn success_sends_once_and_never_again() {
+        let mock = MockHec::start(vec![Reply::Status(200, r#"{"text":"Success","code":0}"#)]);
+        client(&mock, 3).send(events(3)).await.unwrap();
+        assert_eq!(mock.requests().len(), 1);
+    }
+
+    /// A partial-success 400 says how far it got. The prefix is committed, the
+    /// named event is bad, and the rest was never seen — so the right move is
+    /// to skip past the bad one and continue, not to resend from the start.
+    #[tokio::test]
+    async fn partial_success_skips_the_bad_event_and_resumes_after_it() {
+        let mock = MockHec::start(vec![Reply::Status(
+            400,
+            r#"{"text":"Invalid data format","code":6,"invalid-event-number":2}"#,
+        )]);
+        client(&mock, 3).send(events(5)).await.unwrap();
+
+        let reqs = mock.requests();
+        assert_eq!(reqs.len(), 2, "expected the retry to resume, not restart");
+        // Second attempt starts at index 3: 0 and 1 committed, 2 was rejected.
+        assert!(
+            reqs[1].1.starts_with(r#"{"event":3}"#),
+            "resumed at the wrong offset: {}",
+            reqs[1].1
+        );
+        assert!(
+            !reqs[1].1.contains(r#"{"event":2}"#),
+            "the rejected event must not be resent: {}",
+            reqs[1].1
+        );
+    }
+
+    /// Deterministic progress is not a retry, so it must not consume the
+    /// budget — otherwise a batch with several bad events gives up early and
+    /// discards the good ones after it.
+    #[tokio::test]
+    async fn skipping_bad_events_does_not_spend_the_retry_budget() {
+        let bad = |n: usize| {
+            Reply::Status(
+                400,
+                Box::leak(
+                    format!(r#"{{"text":"x","code":6,"invalid-event-number":{n}}}"#)
+                        .into_boxed_str(),
+                ),
+            )
+        };
+        // Four rejections in a row, with a retry budget of one.
+        let mock = MockHec::start(vec![bad(0), bad(0), bad(0), bad(0)]);
+        client(&mock, 1).send(events(6)).await.unwrap();
+        assert_eq!(
+            mock.requests().len(),
+            5,
+            "each rejection should advance and continue, not exhaust retries"
+        );
+    }
+
+    /// A bad token cannot be fixed by asking again.
+    #[tokio::test]
+    async fn an_auth_failure_is_permanent() {
+        let mock = MockHec::start(vec![Reply::Status(401, r#"{"text":"Invalid token"}"#)]);
+        let err = client(&mock, 3).send(events(2)).await.unwrap_err();
+        assert!(err.to_string().contains("401"), "{err}");
+        assert_eq!(mock.requests().len(), 1, "401 must not be retried");
+    }
+
+    /// A 400 without `invalid-event-number` is a protocol fault, not progress.
+    #[tokio::test]
+    async fn a_400_without_an_event_number_is_permanent() {
+        let mock = MockHec::start(vec![Reply::Status(400, r#"{"text":"No data","code":5}"#)]);
+        let err = client(&mock, 3).send(events(2)).await.unwrap_err();
+        assert!(err.to_string().contains("code=5"), "{err}");
+        assert_eq!(mock.requests().len(), 1);
+    }
+
+    /// 413 means the batch was too big, so halve it and send both halves.
+    #[tokio::test]
+    async fn too_large_splits_the_batch_rather_than_dropping_it() {
+        let mock = MockHec::start(vec![Reply::Status(413, "too large")]);
+        client(&mock, 3).send(events(4)).await.unwrap();
+
+        let reqs = mock.requests();
+        assert_eq!(reqs.len(), 3, "one rejected attempt, then two halves");
+        // Together the halves must carry every event exactly once.
+        let resent = format!("{}{}", reqs[1].1, reqs[2].1);
+        for i in 0..4 {
+            assert_eq!(
+                resent.matches(&format!(r#"{{"event":{i}}}"#)).count(),
+                1,
+                "event {i} appears the wrong number of times after the split"
+            );
+        }
+    }
+
+    /// A 5xx may or may not have landed, so retry — and give up loudly rather
+    /// than reporting a success that did not happen.
+    #[tokio::test]
+    async fn a_server_error_retries_then_reports_failure() {
+        let mock = MockHec::start(vec![
+            Reply::Status(503, "unavailable"),
+            Reply::Status(503, "unavailable"),
+            Reply::Status(503, "unavailable"),
+        ]);
+        let err = client(&mock, 2).send(events(2)).await.unwrap_err();
+        assert!(err.to_string().contains("giving up"), "{err}");
+        assert_eq!(mock.requests().len(), 3, "one attempt plus two retries");
+    }
+
+    /// The same, but the server recovers — the write must then succeed.
+    #[tokio::test]
+    async fn a_server_error_that_clears_is_not_an_error() {
+        let mock = MockHec::start(vec![
+            Reply::Status(503, "unavailable"),
+            Reply::Status(200, r#"{"text":"Success","code":0}"#),
+        ]);
+        client(&mock, 3).send(events(2)).await.unwrap();
+        assert_eq!(mock.requests().len(), 2);
+    }
+
+    /// A request that is accepted and never answered must time out, count as
+    /// transient, and be retried — not hang the flush until the server feels
+    /// like replying.
+    #[tokio::test]
+    async fn a_timeout_is_retried_and_the_retry_can_succeed() {
+        let mock = MockHec::start(vec![Reply::Hang]);
+        let started = std::time::Instant::now();
+        client(&mock, 1).send(events(2)).await.unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "the 1s request timeout did not apply: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(mock.requests().len(), 2, "one attempt plus one retry");
+    }
+
+    /// When every attempt times out, the flush must fail rather than report a
+    /// success nobody can back up.
+    #[tokio::test]
+    async fn a_persistent_timeout_eventually_fails() {
+        let mock = MockHec::start(vec![Reply::Hang, Reply::Hang, Reply::Hang]);
+        let err = client(&mock, 1).send(events(2)).await.unwrap_err();
+        assert!(err.to_string().contains("giving up"), "{err}");
+        assert_eq!(mock.requests().len(), 2, "one attempt plus one retry");
+    }
+
+    /// With acks on, a request that failed *after* the server committed it
+    /// must not be resent. The mock answers `{"0": false}` — not committed —
+    /// so this one still resends; the positive case needs a real server and
+    /// lives in the live suite.
+    #[tokio::test]
+    async fn an_unacknowledged_batch_is_resent() {
+        let mock = MockHec::start(vec![Reply::Status(503, "unavailable")]);
+        let c = HecClient::new(&SglakeConfig {
+            url: format!("http://{}", mock.addr),
+            write_retries: 1,
+            retry_backoff_ms: 1,
+            request_timeout_secs: 1,
+            gzip: false,
+            use_ack: true,
+            ..Default::default()
+        })
+        .unwrap();
+        let _ = c.send(events(2)).await;
+        let paths: Vec<&str> = mock
+            .requests()
+            .iter()
+            .map(|(p, _)| p.as_str())
+            .map(|p| {
+                if p.starts_with("/services/collector/event") {
+                    "event"
+                } else {
+                    "other"
+                }
+            })
+            .collect();
+        assert_eq!(
+            paths,
+            vec!["event", "event"],
+            "an unacked batch must be resent"
+        );
+    }
+}

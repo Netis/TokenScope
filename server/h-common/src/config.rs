@@ -1235,6 +1235,8 @@ pub enum ConfigIssue {
     /// Body indexes are set to outlive the span metadata that points at them,
     /// leaving bodies nothing can reach. `0` means "inherit", which is always
     /// consistent. Only emitted when `storage.backend == "sglake"`.
+    /// `storage.sglake.url` names a host other than loopback.
+    SglakeUrlNotLoopback { url: String, host: String },
     SglakeBodyRetentionExceedsParent {
         body_days: u32,
         /// Which entity's retention the bodies would outlive — `spans` for the
@@ -1256,6 +1258,7 @@ impl ConfigIssue {
             | Self::PcapDumpRetentionNoRules { .. }
             // Orphaned bodies waste space but break nothing: the metadata
             // rows that would reference them are already gone.
+            | Self::SglakeUrlNotLoopback { .. }
             | Self::SglakeBodyRetentionExceedsParent { .. } => IssueSeverity::Warn,
             Self::DuplicatePipelineName(_)
             | Self::DuplicateSourceId { .. }
@@ -1365,6 +1368,15 @@ impl std::fmt::Display for ConfigIssue {
                  full-size events would be dropped before being sent. Raise \
                  max_event_bytes or lower [body_cap]."
             ),
+            Self::SglakeUrlNotLoopback { url, host } => write!(
+                f,
+                "storage.sglake.url points at '{host}' ({url}). sglake's \
+                 /api/v1/* search endpoints have no authentication of their \
+                 own — every stored request and response body is readable by \
+                 anyone who can reach that port, and Heron cannot restrict \
+                 it. Bind sglogd to 127.0.0.1, or put the link on a network \
+                 only Heron can use."
+            ),
             Self::SglakeBodyRetentionExceedsParent {
                 body_days,
                 parent,
@@ -1393,6 +1405,41 @@ impl std::fmt::Display for ConfigIssue {
 /// Empty paths and parent-of-relative-paths that bottom out to "" are
 /// normalized to `.` so a relative `data/foo.duckdb` whose `data/` doesn't
 /// yet exist still probes the cwd (which is what `mkdir -p data` would do).
+/// Host portion of a `scheme://host[:port][/path]` URL, lowercased.
+///
+/// Deliberately not a URL parser: the only question is which host the operator
+/// named, and pulling in a dependency to answer it — or failing closed on a
+/// shape a real parser would reject — would both be worse than saying nothing.
+/// An unparseable URL returns `None` and is left to fail at connect time with
+/// a message about the actual problem.
+fn sglake_url_host(url: &str) -> Option<String> {
+    let rest = url.split("://").nth(1)?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    // Strip userinfo, then the port — but not the colons inside a bracketed
+    // IPv6 literal.
+    let authority = authority.rsplit('@').next()?;
+    let host = if let Some(end) = authority.find(']') {
+        &authority[..=end]
+    } else {
+        authority.split(':').next()?
+    };
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+}
+
+/// Whether a host names this machine only.
+fn is_loopback_host(host: &str) -> bool {
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if bare == "localhost" {
+        return true;
+    }
+    match bare.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.is_loopback(),
+        // A name that is not an address could resolve anywhere; only the
+        // conventional one is treated as local.
+        Err(_) => false,
+    }
+}
+
 fn is_writable_dir(dir: &Path) -> bool {
     let mut probe_root = if dir.as_os_str().is_empty() {
         PathBuf::from(".")
@@ -1537,6 +1584,19 @@ impl AppConfig {
                     prefix: sg.index_prefix.clone(),
                     index: format!("{prefix}_spans"),
                 });
+            }
+            // The search API sglake exposes is unauthenticated, so where it
+            // listens is the entire access control story for the bodies Heron
+            // stores there. Heron does not start sglogd and cannot bind it, so
+            // this is the one place the risk can be named — and a non-loopback
+            // URL is the observable symptom of it.
+            if let Some(host) = sglake_url_host(&sg.url) {
+                if !is_loopback_host(&host) {
+                    issues.push(ConfigIssue::SglakeUrlNotLoopback {
+                        url: sg.url.clone(),
+                        host,
+                    });
+                }
             }
             // A body at the cap plus its headers and JSON escaping has to fit
             // in one event, or the write path drops it every time.
@@ -2344,6 +2404,114 @@ mod phase2_tests {
             .validate()
             .iter()
             .any(|i| matches!(i, ConfigIssue::SglakeBodyRetentionExceedsParent { .. })));
+    }
+
+    #[test]
+    fn loopback_urls_are_accepted_and_anything_else_is_flagged() {
+        for url in [
+            "http://127.0.0.1:5959",
+            "http://localhost:5959",
+            "https://LOCALHOST/",
+            "http://[::1]:5959",
+            "http://127.5.6.7:5959",
+            "http://user:pw@127.0.0.1:5959/x",
+        ] {
+            let host = sglake_url_host(url).unwrap_or_else(|| panic!("no host in {url}"));
+            assert!(
+                is_loopback_host(&host),
+                "{url} -> {host} should be loopback"
+            );
+        }
+        for url in [
+            "http://10.0.0.5:5959",
+            "http://sglog.internal:5959",
+            "http://[2001:db8::1]:5959",
+            "http://0.0.0.0:5959",
+        ] {
+            let host = sglake_url_host(url).unwrap_or_else(|| panic!("no host in {url}"));
+            assert!(
+                !is_loopback_host(&host),
+                "{url} -> {host} should not be loopback"
+            );
+        }
+        // Unparseable input says nothing rather than guessing.
+        assert_eq!(sglake_url_host("not a url"), None);
+    }
+
+    /// The search API has no auth of its own, so where sglogd listens is the
+    /// only thing standing between stored request bodies and the network.
+    #[test]
+    fn a_non_loopback_sglake_url_is_warned_about() {
+        let cfg = AppConfig::from_toml(
+            r#"
+            [[pipeline]]
+            name = "p"
+            [[pipeline.sources]]
+            type = "pcap"
+            interface = "eth0"
+
+            [storage]
+            backend = "sglake"
+
+            [storage.sglake]
+            url = "http://10.0.0.5:5959"
+            "#,
+        );
+        let issue = cfg
+            .validate()
+            .into_iter()
+            .find(|i| matches!(i, ConfigIssue::SglakeUrlNotLoopback { .. }))
+            .expect("expected the loopback warning");
+        assert_eq!(issue.severity(), IssueSeverity::Warn);
+        assert!(
+            issue.to_string().contains("no authentication"),
+            "the message must say why: {issue}"
+        );
+
+        let cfg = AppConfig::from_toml(
+            r#"
+            [[pipeline]]
+            name = "p"
+            [[pipeline.sources]]
+            type = "pcap"
+            interface = "eth0"
+
+            [storage]
+            backend = "sglake"
+
+            [storage.sglake]
+            url = "http://127.0.0.1:5959"
+            "#,
+        );
+        assert!(!cfg
+            .validate()
+            .iter()
+            .any(|i| matches!(i, ConfigIssue::SglakeUrlNotLoopback { .. })));
+    }
+
+    /// Only when sglake is the active backend — an unused `[storage.sglake]`
+    /// block is not a finding.
+    #[test]
+    fn the_loopback_warning_is_scoped_to_the_active_backend() {
+        let cfg = AppConfig::from_toml(
+            r#"
+            [[pipeline]]
+            name = "p"
+            [[pipeline.sources]]
+            type = "pcap"
+            interface = "eth0"
+
+            [storage]
+            backend = "duckdb"
+
+            [storage.sglake]
+            url = "http://10.0.0.5:5959"
+            "#,
+        );
+        assert!(!cfg
+            .validate()
+            .iter()
+            .any(|i| matches!(i, ConfigIssue::SglakeUrlNotLoopback { .. })));
     }
 
     #[test]

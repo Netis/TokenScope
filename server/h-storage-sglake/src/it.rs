@@ -1239,7 +1239,7 @@ async fn services_aggregate_endpoints_and_build_a_graph() {
         c.status_code = Some(if i == 5 { 500 } else { 200 });
         c.server_ip = "10.0.0.1".parse().unwrap();
         c.server_port = 8000;
-        c.client_ip = "192.168.9.9".parse().unwrap();
+        c.client_ip = "203.0.113.9".parse().unwrap();
         calls.push(c);
     }
     backend.write_spans(calls.clone()).await.unwrap();

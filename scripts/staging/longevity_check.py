@@ -10,10 +10,15 @@ checkpoint hit a "broken index" FATAL → SIGSEGV):
   - no_fatal_logs       : no panic / "broken index" / checkpoint FATAL ever.
   - no_flush_errors     : storage never reported a flush error.
   - rss_stable          : post-warmup RSS growth < threshold (memory leak).
-  - db_growth_sane      : on-disk DuckDB bytes-PER-stored-call stays bounded —
-                          the DB may grow with ingestion, but it must grow
+  - db_growth_sane      : on-disk bytes-PER-stored-call stays bounded — the
+                          store may grow with ingestion, but it must grow
                           ~linearly with data, not super-linearly (the index /
                           checkpoint bloat that ran prod to 102 GB).
+  - bucket_growth_sane  : sglake only. Buckets-per-stored-call stays bounded.
+                          Search cost scales with how many buckets a query has
+                          to open, so a store accumulating buckets faster than
+                          data gets slower to read while looking fine on disk.
+                          Reported only when the sampler emits `buckets`.
   - load_sustained      : the run actually ingested a meaningful packet volume
                           for its whole window (didn't silently stall).
 
@@ -82,7 +87,8 @@ def _metric(sample, name, default=0):
 
 
 def evaluate(samples, fatals, *, max_rss_growth_pct, max_bytes_per_call_growth_pct,
-             min_pkts, warmup_frac, min_calls_for_db_check):
+             min_pkts, warmup_frac, min_calls_for_db_check,
+             max_bucket_per_call_growth_pct=50.0):
     """Return a list of {name, ok, detail} invariant results."""
     inv = []
     inv.append(("no_fatal_logs", len(fatals) == 0,
@@ -139,6 +145,43 @@ def evaluate(samples, fatals, *, max_rss_growth_pct, max_bytes_per_call_growth_p
         inv.append(("db_growth_sane", False,
                     "no db_bytes / calls_ingested samples to size the DB growth"))
 
+    # --- bucket growth: only meaningful on sglake ---
+    # A log store expires and compacts by whole buckets, so the failure that
+    # matters over a long run is not total bytes but bucket *count*: every
+    # search opens each candidate bucket to test its bloom and time index, so a
+    # store that accumulates buckets faster than it accumulates data gets
+    # steadily slower to read while looking perfectly healthy on disk. The
+    # knob behind it (`--max-hot-raw-mib`) belongs to the log daemon, not to
+    # Heron, which is exactly why this has to be observed rather than assumed.
+    #
+    # Same shape as the bytes-per-call check: absolute count grows with
+    # ingestion, so gate on buckets *per stored call* holding steady. Absent
+    # from a DuckDB run, where there is nothing to count.
+    def buckets_per_call(s):
+        calls = _metric(s, "calls_ingested")
+        b = s.get("buckets")
+        return (b / calls) if calls > 0 and b else None
+
+    if not any("buckets" in s for s in samples):
+        pass  # not a bucketed store; no invariant to report
+    elif calls_last < min_calls_for_db_check:
+        inv.append(("bucket_growth_sane", True,
+                    f"skipped — only {calls_last} calls"))
+    else:
+        early_b = next((buckets_per_call(s) for s in post if buckets_per_call(s)), None)
+        late_b = next((buckets_per_call(s) for s in reversed(post)
+                       if buckets_per_call(s)), None)
+        if early_b and late_b:
+            growth = (late_b - early_b) / early_b * 100.0
+            inv.append(("bucket_growth_sane",
+                        growth <= max_bucket_per_call_growth_pct,
+                        f"buckets/call {early_b:.4f}→{late_b:.4f} = {growth:+.1f}% "
+                        f"(limit {max_bucket_per_call_growth_pct}%), "
+                        f"{samples[-1].get('buckets')} buckets at the end"))
+        else:
+            inv.append(("bucket_growth_sane", False,
+                        "buckets reported but no usable buckets/call ratio"))
+
     # --- load actually sustained for the window ---
     last_pkts = _metric(samples[-1], "pkts_received")
     inv.append(("load_sustained", last_pkts >= min_pkts,
@@ -157,6 +200,7 @@ def main():
     ap.add_argument("--min-pkts", type=int, default=100000)
     ap.add_argument("--warmup-frac", type=float, default=0.25)
     ap.add_argument("--min-calls-for-db-check", type=int, default=1000)
+    ap.add_argument("--max-bucket-per-call-growth-pct", type=float, default=50.0)
     args = ap.parse_args()
 
     samples = load_samples(args.samples)
@@ -165,7 +209,8 @@ def main():
                    max_rss_growth_pct=args.max_rss_growth_pct,
                    max_bytes_per_call_growth_pct=args.max_bytes_per_call_growth_pct,
                    min_pkts=args.min_pkts, warmup_frac=args.warmup_frac,
-                   min_calls_for_db_check=args.min_calls_for_db_check)
+                   min_calls_for_db_check=args.min_calls_for_db_check,
+                   max_bucket_per_call_growth_pct=args.max_bucket_per_call_growth_pct)
     passed = all(i["ok"] for i in inv)
 
     def g(s, k):
@@ -180,6 +225,7 @@ def main():
             "samples": len(samples),
             "rss_kb": {"first": g(first, "rss_kb"), "last": g(last, "rss_kb")},
             "db_bytes": {"first": g(first, "db_bytes"), "last": g(last, "db_bytes")},
+            "buckets": {"first": g(first, "buckets"), "last": g(last, "buckets")},
             "calls_ingested_last": _metric(last, "calls_ingested") if last else 0,
             "pkts_received_last": _metric(last, "pkts_received") if last else 0,
         },
