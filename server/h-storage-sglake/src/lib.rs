@@ -43,12 +43,15 @@
 
 mod calls;
 mod client;
+mod dims;
+mod distincts;
 mod exchanges;
 mod it;
 mod metrics;
 mod read;
 mod rows;
 mod schema;
+mod services;
 mod sessions;
 mod spl;
 mod turns;
@@ -123,20 +126,6 @@ impl SglakeBackend {
             manage_retention: config.manage_retention,
         })
     }
-}
-
-/// Phase-gated stub. Read paths that are not implemented yet return an empty
-/// result **and say so** — a silent empty page is indistinguishable from "no
-/// data" and would make a half-built backend look like a working one.
-macro_rules! unimplemented_read {
-    ($method:literal, $empty:expr) => {{
-        tracing::warn!(
-            target: "sglake::unimplemented",
-            method = $method,
-            "sglake backend: read path not implemented yet; returning an empty result"
-        );
-        Ok($empty)
-    }};
 }
 
 #[async_trait]
@@ -232,98 +221,78 @@ impl StorageBackend for SglakeBackend {
 
     async fn query_metrics_timeseries(
         &self,
-        _query: &MetricsTimeseriesQuery,
+        query: &MetricsTimeseriesQuery,
     ) -> Result<Vec<MetricsTimeseriesRow>> {
-        unimplemented_read!("query_metrics_timeseries", Vec::new())
+        SglakeBackend::query_metrics_timeseries(self, query).await
     }
 
     async fn query_metrics_summary(
         &self,
-        _query: &MetricsSummaryQuery,
+        query: &MetricsSummaryQuery,
     ) -> Result<MetricsSummaryRow> {
-        unimplemented_read!(
-            "query_metrics_summary",
-            MetricsSummaryRow {
-                call_count: 0,
-                error_count: 0,
-                error_4xx_count: 0,
-                error_429_count: 0,
-                error_5xx_count: 0,
-                total_input_tokens: 0,
-                total_output_tokens: 0,
-                ttft_avg: None,
-                e2e_avg: None,
-                tpot_avg: None,
-            }
-        )
+        SglakeBackend::query_metrics_summary(self, query).await
     }
 
     async fn query_metrics_models(
         &self,
-        _query: &MetricsModelsQuery,
+        query: &MetricsModelsQuery,
     ) -> Result<Vec<MetricsModelRow>> {
-        unimplemented_read!("query_metrics_models", Vec::new())
+        SglakeBackend::query_metrics_models(self, query).await
     }
 
     async fn query_finish_reasons(
         &self,
-        _query: &FinishReasonsQuery,
+        query: &FinishReasonsQuery,
     ) -> Result<Vec<FinishReasonTimeseries>> {
-        unimplemented_read!("query_finish_reasons", Vec::new())
+        SglakeBackend::query_finish_reasons(self, query).await
     }
 
-    async fn query_services(&self, _query: &ServicesQuery) -> Result<Vec<ServiceRow>> {
-        unimplemented_read!("query_services", Vec::new())
+    async fn query_services(&self, query: &ServicesQuery) -> Result<Vec<ServiceRow>> {
+        SglakeBackend::query_services(self, query).await
     }
 
     async fn query_services_topology(
         &self,
-        _query: &ServicesTopologyQuery,
+        query: &ServicesTopologyQuery,
     ) -> Result<ServicesTopology> {
-        unimplemented_read!(
-            "query_services_topology",
-            ServicesTopology {
-                nodes: Vec::new(),
-                edges: Vec::new()
-            }
-        )
+        SglakeBackend::query_services_topology(self, query).await
     }
 
     async fn query_agent_summary(
         &self,
-        _query: &AgentSummaryQuery,
+        query: &AgentSummaryQuery,
     ) -> Result<Vec<AgentKindSummary>> {
-        unimplemented_read!("query_agent_summary", Vec::new())
+        SglakeBackend::query_agent_summary(self, query).await
     }
 
     async fn query_agent_activity(
         &self,
-        _query: &AgentActivityQuery,
+        query: &AgentActivityQuery,
     ) -> Result<Vec<AgentActivityPoint>> {
-        unimplemented_read!("query_agent_activity", Vec::new())
+        SglakeBackend::query_agent_activity(self, query).await
     }
 
     async fn query_distinct_wire_apis(&self) -> Result<Vec<String>> {
-        unimplemented_read!("query_distinct_wire_apis", Vec::new())
+        SglakeBackend::query_distinct_wire_apis(self).await
     }
 
     async fn query_distinct_models(&self) -> Result<Vec<String>> {
-        unimplemented_read!("query_distinct_models", Vec::new())
+        SglakeBackend::query_distinct_models(self).await
     }
 
     async fn query_distinct_server_ips(&self) -> Result<Vec<String>> {
-        unimplemented_read!("query_distinct_server_ips", Vec::new())
+        SglakeBackend::query_distinct_server_ips(self).await
     }
 
     async fn query_distinct_agent_kinds(
         &self,
-        _query: &DistinctAgentKindsQuery,
+        query: &DistinctAgentKindsQuery,
     ) -> Result<Vec<String>> {
-        unimplemented_read!("query_distinct_agent_kinds", Vec::new())
+        SglakeBackend::query_distinct_agent_kinds(self, query).await
     }
 
     async fn query_distinct_finish_reasons(&self) -> Result<Vec<DistinctFinishReason>> {
-        unimplemented_read!("query_distinct_finish_reasons", Vec::new())
+        SglakeBackend::query_distinct_finish_reasons(self).await
     }
 
     // ---- Phase 4 ---------------------------------------------------------

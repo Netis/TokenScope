@@ -966,3 +966,471 @@ async fn session_filters_apply_before_aggregation() {
     assert_eq!(p.items[0].session_id, "AK2");
     assert_eq!(p.items[0].agent_kind, "codex-cli");
 }
+
+// ---------------------------------------------------------------------------
+// Phase 3: aggregates
+// ---------------------------------------------------------------------------
+
+/// Write metric rows on all four rollup tiers, the way the aggregator does.
+/// The rollup rows carry the literal `'*'` sentinel, which is the value a
+/// naive translation would read as a wildcard.
+async fn seed_tiers(backend: &SglakeBackend, base_us: i64) {
+    let mut rows = Vec::new();
+    let mut mk = |wire: &str, model: &str, server: &str, calls: u64, ttft: f64| {
+        let mut m = fixtures::sample_metric();
+        m.timestamp_us = base_us;
+        m.granularity = "10s";
+        m.wire_api = wire.into();
+        m.model = model.into();
+        m.server_ip = server.into();
+        m.call_count = calls;
+        m.ttft_sum = ttft;
+        m.ttft_count = calls;
+        m.ttft_p95 = Some(ttft / calls as f64);
+        m.error_count = 0;
+        m.tool_surface = None;
+        rows.push(m);
+    };
+    // Detail rows: 2 models on 1 server.
+    mk("openai-chat", "gpt-4", "10.0.0.1", 10, 1000.0);
+    mk("openai-chat", "gpt-4o", "10.0.0.1", 5, 250.0);
+    // The three rollups the aggregator materializes over them.
+    mk("openai-chat", "gpt-4", "*", 10, 1000.0);
+    mk("openai-chat", "gpt-4o", "*", 5, 250.0);
+    mk("*", "*", "10.0.0.1", 15, 1250.0);
+    mk("*", "*", "*", 15, 1250.0);
+    backend.write_metrics(rows).await.unwrap();
+}
+
+fn tr(base_us: i64) -> TimeRange {
+    TimeRange {
+        start_us: base_us - 60_000_000,
+        end_us: base_us + 60_000_000,
+    }
+}
+
+/// The headline metrics correctness property. Every filter shape must read
+/// exactly one rollup tier: reading two would sum a rollup on top of the
+/// detail rows it already contains and silently double every number.
+#[tokio::test]
+async fn metrics_read_one_tier_and_never_double_count() {
+    let backend = require_backend!();
+    let base = 1_785_650_000_000_000_i64;
+    seed_tiers(&backend, base).await;
+
+    let summary = |filter: DimensionFilter| MetricsSummaryQuery {
+        time_range: tr(base),
+        filter,
+    };
+
+    // No filter → the grand-total row alone. 15, not 15+15+15.
+    let s = eventually("metrics", || async {
+        let s = backend
+            .query_metrics_summary(&summary(DimensionFilter::default()))
+            .await
+            .unwrap();
+        (s.call_count > 0).then_some(s)
+    })
+    .await;
+    assert_eq!(s.call_count, 15, "unfiltered total must read only (*,*,*)");
+    assert_eq!(s.ttft_avg, Some(1250.0 / 15.0));
+
+    // Server filter → the per-server rollup alone.
+    let s = backend
+        .query_metrics_summary(&summary(DimensionFilter {
+            server_ips: vec!["10.0.0.1".into()],
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(s.call_count, 15, "server filter must read only (*,*,S)");
+
+    // Model filter → that model's (W,M,*) row alone.
+    let s = backend
+        .query_metrics_summary(&summary(DimensionFilter {
+            models: vec!["gpt-4".into()],
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(s.call_count, 10);
+
+    // Both models → both (W,M,*) rows, summed.
+    let s = backend
+        .query_metrics_summary(&summary(DimensionFilter {
+            models: vec!["gpt-4".into(), "gpt-4o".into()],
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(s.call_count, 15);
+
+    // Model + server → the finest tier.
+    let s = backend
+        .query_metrics_summary(&summary(DimensionFilter {
+            models: vec!["gpt-4".into()],
+            server_ips: vec!["10.0.0.1".into()],
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(s.call_count, 10);
+}
+
+#[tokio::test]
+async fn metrics_timeseries_computes_derived_fields() {
+    let backend = require_backend!();
+    let base = 1_785_651_000_000_000_i64;
+    seed_tiers(&backend, base).await;
+
+    let q = |fields: Vec<String>, group_by: Option<String>| MetricsTimeseriesQuery {
+        time_range: tr(base),
+        granularity: "10s".into(),
+        filter: DimensionFilter::default(),
+        fields,
+        group_by,
+    };
+
+    let rows = eventually("timeseries", || async {
+        let r = backend
+            .query_metrics_timeseries(&q(vec!["call_count".into()], None))
+            .await
+            .unwrap();
+        (!r.is_empty()).then_some(r)
+    })
+    .await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].values, vec![Some(15.0)]);
+    // Timestamps come back in seconds, on the API's grid.
+    assert_eq!(rows[0].timestamp, base / 1_000_000);
+    assert!(rows[0].group.is_none());
+
+    // Derived fields: an exact ratio and a count-weighted percentile, in the
+    // order requested.
+    let rows = backend
+        .query_metrics_timeseries(&q(
+            vec!["ttft_avg".into(), "call_count".into(), "ttft_p95".into()],
+            None,
+        ))
+        .await
+        .unwrap();
+    let v = &rows[0].values;
+    assert_eq!(v[0], Some(1250.0 / 15.0), "ttft_avg is sum/count");
+    assert_eq!(v[1], Some(15.0));
+    assert!(v[2].is_some(), "weighted percentile should resolve: {v:?}");
+
+    // Grouping by model forces the detail tier even with no model filter.
+    let rows = backend
+        .query_metrics_timeseries(&q(vec!["call_count".into()], Some("model".into())))
+        .await
+        .unwrap();
+    let mut got: Vec<(String, Option<f64>)> = rows
+        .into_iter()
+        .map(|r| (r.group.unwrap_or_default(), r.values[0]))
+        .collect();
+    got.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        got,
+        vec![
+            ("gpt-4".to_string(), Some(10.0)),
+            ("gpt-4o".to_string(), Some(5.0))
+        ],
+        "grouping by model must not return the '*' rollup as a group"
+    );
+
+    // Unknown fields and group_by are refused, not silently dropped.
+    assert!(backend
+        .query_metrics_timeseries(&q(vec!["nope".into()], None))
+        .await
+        .is_err());
+    assert!(backend
+        .query_metrics_timeseries(&q(vec!["call_count".into()], Some("id".into())))
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn metrics_models_and_finish_reasons_aggregate() {
+    let backend = require_backend!();
+    let base = 1_785_652_000_000_000_i64;
+    seed_tiers(&backend, base).await;
+    backend
+        .write_finish_metrics(vec![
+            LlmFinishMetric {
+                timestamp_us: base,
+                source_id: "src-0".into(),
+                granularity: "10s".into(),
+                wire_api: "*".into(),
+                model: "*".into(),
+                server_ip: "*".into(),
+                finish_reason: "stop".into(),
+                count: 12,
+            },
+            LlmFinishMetric {
+                timestamp_us: base,
+                source_id: "src-0".into(),
+                granularity: "10s".into(),
+                wire_api: "*".into(),
+                model: "*".into(),
+                server_ip: "*".into(),
+                finish_reason: "length".into(),
+                count: 3,
+            },
+        ])
+        .await
+        .unwrap();
+
+    let models = eventually("models", || async {
+        let m = backend
+            .query_metrics_models(&MetricsModelsQuery {
+                time_range: tr(base),
+                filter: DimensionFilter::default(),
+                sort_by: "call_count".into(),
+                sort_order: "DESC".into(),
+                limit: 10,
+            })
+            .await
+            .unwrap();
+        (m.len() == 2).then_some(m)
+    })
+    .await;
+    // Sorted by call_count descending, reading the detail tier.
+    assert_eq!(models[0].model, "gpt-4");
+    assert_eq!(models[0].call_count, 10);
+    assert_eq!(models[1].model, "gpt-4o");
+    assert_eq!(models[1].call_count, 5);
+    assert_eq!(models[0].ttft_avg, Some(100.0));
+
+    let reasons = eventually("finish reasons", || async {
+        let r = backend
+            .query_finish_reasons(&FinishReasonsQuery {
+                time_range: tr(base),
+                granularity: "10s".into(),
+                wire_apis: vec![],
+                models: vec![],
+                server_ips: vec![],
+            })
+            .await
+            .unwrap();
+        (r.len() == 2).then_some(r)
+    })
+    .await;
+    let mut by_reason: Vec<(String, u64)> = reasons
+        .into_iter()
+        .map(|s| (s.finish_reason, s.points.iter().map(|(_, c)| c).sum()))
+        .collect();
+    by_reason.sort();
+    assert_eq!(
+        by_reason,
+        vec![("length".to_string(), 3u64), ("stop".to_string(), 12)]
+    );
+}
+
+#[tokio::test]
+async fn services_aggregate_endpoints_and_build_a_graph() {
+    let backend = require_backend!();
+    let base = 1_785_653_000_000_000_i64;
+    let mut calls = Vec::new();
+    for i in 0..6 {
+        let mut c = fixtures::full_call();
+        c.id = format!("svc-{i}-{}", uuid::Uuid::now_v7());
+        c.request_time = base + i * 1_000_000;
+        c.model = if i % 2 == 0 { "gpt-4" } else { "gpt-4o" }.into();
+        c.status_code = Some(if i == 5 { 500 } else { 200 });
+        c.server_ip = "10.0.0.1".parse().unwrap();
+        c.server_port = 8000;
+        c.client_ip = "192.168.9.9".parse().unwrap();
+        calls.push(c);
+    }
+    backend.write_spans(calls.clone()).await.unwrap();
+
+    let rows = eventually("services", || async {
+        let r = backend
+            .query_services(&ServicesQuery {
+                time_range: tr(base),
+                sort_by: "call_count".into(),
+                sort_order: "DESC".into(),
+                limit: 50,
+            })
+            .await
+            .unwrap();
+        (!r.is_empty()).then_some(r)
+    })
+    .await;
+    let ep = &rows[0];
+    assert_eq!(ep.server_ip, "10.0.0.1");
+    assert_eq!(ep.server_port, 8000);
+    assert_eq!(ep.call_count, 6);
+    assert_eq!(
+        ep.error_count, 1,
+        "the 5xx call must be counted as an error"
+    );
+    assert_eq!(ep.stream_count, 6);
+    let mut models = ep.models.clone();
+    models.sort();
+    assert_eq!(models, vec!["gpt-4".to_string(), "gpt-4o".to_string()]);
+    assert!(ep.ttft_avg_ms.is_some());
+    assert!(ep.ttft_p95_ms.is_some(), "perc95 must resolve");
+    assert_eq!(ep.first_seen_ms, base / 1000);
+    assert_eq!(ep.last_seen_ms, (base + 5_000_000) / 1000);
+    // `Server: uvicorn` is lifted out of the headers at write time.
+    assert_eq!(ep.server_header.as_deref(), Some("uvicorn"));
+
+    // A trace over those calls gives the graph an entry edge.
+    let mut t = fixtures::full_trace();
+    t.turn_id = format!("svc-turn-{}", uuid::Uuid::now_v7());
+    t.start_time_us = base;
+    t.end_time_us = base + 6_000_000;
+    t.span_ids = vec![calls[0].id.clone()];
+    t.metadata = serde_json::json!({});
+    backend.write_traces(vec![t]).await.unwrap();
+
+    let topo = eventually("topology", || async {
+        let g = backend
+            .query_services_topology(&ServicesTopologyQuery {
+                time_range: tr(base),
+            })
+            .await
+            .unwrap();
+        (!g.edges.is_empty()).then_some(g)
+    })
+    .await;
+    assert_eq!(topo.nodes.len(), 1);
+    assert_eq!(topo.nodes[0].call_count, 6);
+    // The client IP hosts no known service, so it is an external client.
+    assert_eq!(topo.edges.len(), 1);
+    assert_eq!(topo.edges[0].kind, "client");
+    assert_eq!(topo.edges[0].to_ip, "10.0.0.1");
+    assert_eq!(topo.edges[0].to_port, 8000);
+
+    assert!(backend
+        .query_services(&ServicesQuery {
+            time_range: tr(base),
+            sort_by: "bogus".into(),
+            sort_order: "DESC".into(),
+            limit: 10,
+        })
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn distincts_and_agent_rollups() {
+    let backend = require_backend!();
+    let base = 1_785_654_000_000_000_i64;
+
+    let mut calls = Vec::new();
+    for (i, (wire, model, reason)) in [
+        ("openai-chat", "gpt-4", Some("stop")),
+        ("anthropic", "claude-sonnet", Some("end_turn")),
+        // Still in flight: no finish reason, so not a filter option.
+        ("openai-chat", "gpt-4", None),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut c = fixtures::full_call();
+        c.id = format!("dst-{i}-{}", uuid::Uuid::now_v7());
+        c.request_time = base + i as i64 * 1_000_000;
+        c.wire_api = wire;
+        c.model = model.into();
+        c.finish_reason = reason.map(String::from);
+        calls.push(c);
+    }
+    backend.write_spans(calls).await.unwrap();
+
+    let models = eventually("distinct models", || async {
+        let m = backend.query_distinct_models().await.unwrap();
+        (m.len() == 2).then_some(m)
+    })
+    .await;
+    assert_eq!(
+        models,
+        vec!["claude-sonnet".to_string(), "gpt-4".to_string()]
+    );
+
+    let wires = backend.query_distinct_wire_apis().await.unwrap();
+    assert_eq!(
+        wires,
+        vec!["anthropic".to_string(), "openai-chat".to_string()]
+    );
+    assert_eq!(
+        backend.query_distinct_server_ips().await.unwrap(),
+        vec!["10.0.0.1".to_string()]
+    );
+
+    let reasons = backend.query_distinct_finish_reasons().await.unwrap();
+    let mut pairs: Vec<(String, String)> = reasons
+        .into_iter()
+        .map(|r| (r.wire_api, r.finish_reason))
+        .collect();
+    pairs.sort();
+    assert_eq!(
+        pairs,
+        vec![
+            ("anthropic".to_string(), "end_turn".to_string()),
+            ("openai-chat".to_string(), "stop".to_string())
+        ],
+        "the in-flight call must not contribute an empty finish reason"
+    );
+
+    // Agent rollups, over traces.
+    let mut traces = Vec::new();
+    for (i, kind) in ["claude-cli", "claude-cli", "codex-cli"]
+        .into_iter()
+        .enumerate()
+    {
+        let mut t = fixtures::full_trace();
+        t.turn_id = format!("agt-{i}-{}", uuid::Uuid::now_v7());
+        t.agent_kind = kind.into();
+        t.start_time_us = base + i as i64 * 1_000_000;
+        t.end_time_us = t.start_time_us + 1_000_000;
+        t.duration_ms = 1000;
+        t.total_input_tokens = 100;
+        t.metadata = serde_json::json!({});
+        traces.push(t);
+    }
+    backend.write_traces(traces).await.unwrap();
+
+    let summary = eventually("agent summary", || async {
+        let s = backend
+            .query_agent_summary(&AgentSummaryQuery {
+                time_range: tr(base),
+            })
+            .await
+            .unwrap();
+        (s.len() == 2).then_some(s)
+    })
+    .await;
+    assert_eq!(summary[0].agent_kind, "claude-cli");
+    assert_eq!(summary[0].turn_count, 2);
+    assert_eq!(summary[0].total_input_tokens, 200);
+    assert_eq!(summary[0].avg_duration_ms, Some(1000.0));
+    assert_eq!(summary[1].agent_kind, "codex-cli");
+    assert_eq!(summary[1].turn_count, 1);
+
+    let kinds = backend
+        .query_distinct_agent_kinds(&DistinctAgentKindsQuery {
+            time_range: tr(base),
+            filter: DimensionFilter::default(),
+            include_proxy_hops: false,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        kinds,
+        vec!["claude-cli".to_string(), "codex-cli".to_string()]
+    );
+
+    let activity = backend
+        .query_agent_activity(&AgentActivityQuery {
+            time_range: tr(base),
+            bucket_seconds: Some(3600),
+        })
+        .await
+        .unwrap();
+    assert!(!activity.is_empty(), "bin + stats must produce buckets");
+    let total: u64 = activity.iter().map(|p| p.turn_count).sum();
+    assert_eq!(total, 3);
+    assert!(activity.iter().all(|p| p.timestamp_ms > 0));
+}
