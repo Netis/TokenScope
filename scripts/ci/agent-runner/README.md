@@ -52,6 +52,7 @@ ghost in the repo's runner list.
 docker volume create heron-agent-runner-state
 
 docker run -d --name heron-agent-runner --restart unless-stopped \
+  --network host \
   -v heron-agent-runner-state:/home/runner/actions-runner \
   -e RUNNER_URL=https://github.com/Netis/heron \
   -e RUNNER_TOKEN="$(gh api -X POST repos/Netis/heron/actions/runners/registration-token --jq .token)" \
@@ -74,9 +75,9 @@ its own table and does not forward bridge traffic into `tailscale0`, so
 container traffic falls back to the default route and hangs. Two ways out:
 
 * **`--network host`** on both build and run. Nothing to configure, survives
-  reboots, and it is one added flag on the build and run commands above, which
-  otherwise take the default bridge and will register a runner that then never
-  picks up a job. The cost is that the
+  reboots, and it is the one flag the run command above already carries — drop
+  it on a host with ordinary egress. Without it on a tailnet host the runner
+  registers, reports online, and then never picks up a job. The cost is that the
   container shares the host's network namespace, so it can reach services bound
   to the host's loopback. On a host that also runs production, that includes
   them — sglake's search API in particular is unauthenticated by design, with
