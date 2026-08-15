@@ -1,0 +1,31 @@
+[package]
+name = "h-storage-sglake"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+h-common.workspace = true
+h-llm.workspace = true
+h-metrics.workspace = true
+h-protocol.workspace = true
+h-turn.workspace = true
+h-storage.workspace = true
+reqwest.workspace = true
+# Request-body gzip. reqwest's `gzip` feature only covers *response*
+# decompression, so the HEC request bodies are compressed here.
+flate2.workspace = true
+# `row_id` on metric rows (minted once per batch, reused across retries) and
+# the HEC ack channel id.
+uuid.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+bytes.workspace = true
+# Parses the generated props.toml back, so the stanza renderer is checked
+# against a real TOML parser rather than by eyeballing the string.
+toml_edit.workspace = true

@@ -101,6 +101,45 @@ def _calls(samp):
     return samp["metrics"]["data"]["pipelines"][0]["metrics"][0]["value"]
 
 
+def bucketed(n=12, calls0=2000, bucket_bloat=1.0):
+    """A sglake-shaped series: same as healthy(), plus a bucket count that
+    grows with ingestion, scaled by `bucket_bloat` over the run."""
+    out = healthy(n=n, calls0=calls0)
+    for i, s in enumerate(out):
+        calls = calls0 + i * 500
+        # ~1 bucket per 400 calls at rest.
+        per_call = (1 / 400) * (1 + (bucket_bloat - 1) * (i / (n - 1)))
+        s["buckets"] = int(calls * per_call)
+    return out
+
+
+def test_bucket_growth_absent_on_a_non_bucketed_store():
+    # A DuckDB run reports no `buckets`, so the invariant must not appear at
+    # all — inventing a passing result for a store that has no buckets would
+    # make the nightly report claim coverage it does not have.
+    names = [i["name"] for i in ev(healthy())]
+    assert "bucket_growth_sane" not in names
+
+
+def test_bucket_growth_passes_when_buckets_track_data():
+    invs = ev(bucketed())
+    assert "bucket_growth_sane" in [i["name"] for i in invs]
+    assert "bucket_growth_sane" not in failed(invs)
+
+
+def test_bucket_explosion_fails():
+    # Buckets accumulating 3x faster per call by the end of the run: total
+    # bytes still look linear, but every search now opens three times as many
+    # buckets. This is the signal that only a long run can show.
+    assert "bucket_growth_sane" in failed(ev(bucketed(bucket_bloat=3.0)))
+
+
+def test_bucket_check_skipped_below_min_calls():
+    s = bucketed(calls0=10)
+    invs = ev(s, min_calls_for_db_check=1_000_000)
+    assert "bucket_growth_sane" not in failed(invs)
+
+
 def test_low_throughput_fails_load_sustained():
     assert "load_sustained" in failed(ev(healthy(), min_pkts=10**9))
 

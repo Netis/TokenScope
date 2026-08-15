@@ -194,6 +194,13 @@ impl DuckDbBackend {
         query: &HttpExchangesQuery,
     ) -> Result<HttpExchangesPage> {
         // `duration_ms` is a derived expression; the others are plain columns.
+        //
+        // It is derived through `epoch_us(...) / 1000.0`, not `epoch_ms(...)`:
+        // `epoch_ms` on an interval returns whole milliseconds, so every
+        // sub-millisecond exchange came back as `0.0` and every other one lost
+        // its fraction. The field is an `f64` of milliseconds and both other
+        // backends compute it from microseconds; this one was the outlier, and
+        // a cross-backend replay of the pcap corpus is what surfaced it.
         const VALID_SORT_FIELDS: &[&str] = &["request_time", "status", "duration_ms"];
         if !VALID_SORT_FIELDS.contains(&query.sort_by.as_str()) {
             return Err(AppError::Storage(format!(
@@ -265,7 +272,9 @@ impl DuckDbBackend {
             // keeps incomplete (duration/status=None) rows from dominating
             // descending sort.
             let order_expr = match query.sort_by.as_str() {
-                "duration_ms" => "epoch_ms(response_complete_time - request_time) NULLS LAST",
+                "duration_ms" => {
+                    "epoch_us(response_complete_time - request_time) / 1000.0 NULLS LAST"
+                }
                 "status" => "status NULLS LAST",
                 _ => "request_time",
             };
@@ -287,10 +296,10 @@ impl DuckDbBackend {
                  method, uri, client_ip, server_ip, server_port, \
                  status, is_sse, \
                  CASE WHEN response_complete_time IS NOT NULL \
-                      THEN epoch_ms(response_complete_time - request_time) \
+                      THEN epoch_us(response_complete_time - request_time) / 1000.0 \
                       ELSE NULL END AS duration_ms \
                  FROM http_exchanges WHERE {where_sql} \
-                 ORDER BY {order_expr} {sort_order} \
+                 ORDER BY {order_expr} {sort_order}, id ASC \
                  LIMIT {limit} OFFSET {offset}"
             );
             let mut items_stmt = conn
@@ -351,8 +360,8 @@ impl DuckDbBackend {
 #[cfg(test)]
 mod tests {
     use crate::DuckDbBackend;
-    use std::net::IpAddr;
     use h_storage::StorageBackend;
+    use std::net::IpAddr;
 
     fn in_memory() -> DuckDbBackend {
         DuckDbBackend::open(":memory:").unwrap()
@@ -361,9 +370,9 @@ mod tests {
     #[tokio::test]
     async fn http_exchange_round_trip() {
         use bytes::Bytes;
-        use std::sync::Arc;
         use h_protocol::model::{HttpRequestData, HttpResponseData};
         use h_protocol::net::FlowKey;
+        use std::sync::Arc;
         let backend = in_memory();
         backend.init().await.unwrap();
         let client_ip: IpAddr = "10.0.0.1".parse().unwrap();
@@ -420,9 +429,9 @@ mod tests {
     #[tokio::test]
     async fn http_exchange_sse_round_trip_response_body_none() {
         use bytes::Bytes;
-        use std::sync::Arc;
         use h_protocol::model::{HttpRequestData, HttpResponseData};
         use h_protocol::net::FlowKey;
+        use std::sync::Arc;
         let backend = in_memory();
         backend.init().await.unwrap();
         let client_ip: IpAddr = "10.0.0.1".parse().unwrap();
@@ -471,6 +480,84 @@ mod tests {
         assert!(got.response_body.is_none());
         assert_eq!(got.sse_event_count, 3);
         assert_eq!(got.sse_data_bytes, 42);
+    }
+
+    /// A sub-millisecond exchange must keep its duration.
+    ///
+    /// `epoch_ms` on an interval truncates to whole milliseconds, so this used
+    /// to report `0.0` — the whole value, not just its fraction — for anything
+    /// that completed inside a millisecond. Both other backends compute from
+    /// microseconds; this pins the agreement.
+    #[tokio::test]
+    async fn sub_millisecond_durations_survive_the_list_query() {
+        use bytes::Bytes;
+        use h_protocol::model::{HttpRequestData, HttpResponseData};
+        use h_protocol::net::FlowKey;
+        use h_storage::query::{HttpExchangesQuery, TimeRange};
+        use std::sync::Arc;
+
+        let backend = in_memory();
+        backend.init().await.unwrap();
+        let client_ip: IpAddr = "10.0.0.1".parse().unwrap();
+        let server_ip: IpAddr = "10.0.0.2".parse().unwrap();
+        let t0 = 1_700_000_000_000_000i64;
+        let request = Arc::new(HttpRequestData {
+            flow_key: FlowKey::new("src".into(), client_ip, 5000, server_ip, 8000),
+            client_addr: (client_ip, 5000),
+            server_addr: (server_ip, 8000),
+            method: "POST".into(),
+            uri: "/v1/chat/completions".into(),
+            version: 1,
+            headers: vec![],
+            body: Bytes::from_static(b"{}"),
+            timestamp_us: t0,
+            process: None,
+        });
+        let response = Arc::new(HttpResponseData {
+            flow_key: request.flow_key.clone(),
+            client_addr: request.client_addr,
+            server_addr: request.server_addr,
+            status: 200,
+            version: 1,
+            headers: vec![],
+            body: Bytes::from_static(b"{}"),
+            first_byte_timestamp_us: t0 + 400,
+            // 2.5 ms, chosen so both the whole and the fractional part matter.
+            complete_timestamp_us: t0 + 2_500,
+            process: None,
+        });
+        backend
+            .write_exchanges(vec![h_protocol::HttpExchange {
+                id: "x-1".into(),
+                request,
+                response,
+                sse_event_count: 0,
+                sse_data_bytes: 0,
+            }])
+            .await
+            .unwrap();
+
+        let page = backend
+            .query_http_exchanges(&HttpExchangesQuery {
+                time_range: TimeRange {
+                    start_us: t0 - 1_000_000,
+                    end_us: t0 + 1_000_000,
+                },
+                server_ips: vec![],
+                client_ips: vec![],
+                methods: vec![],
+                status_codes: vec![],
+                uri_contains: None,
+                is_sse: None,
+                sort_by: "request_time".into(),
+                sort_order: "DESC".into(),
+                page: 1,
+                page_size: 10,
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].duration_ms, Some(2.5));
     }
 
     #[tokio::test]
