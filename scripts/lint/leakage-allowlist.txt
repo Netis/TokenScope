@@ -47,3 +47,8 @@ file:server/h-llm/tests/fixtures/**
 file:server/h-protocol/tests/fixtures/**
 file:docs/examples/**
 file:scripts/lint/test-check-leakage.sh
+
+# The agent-runner image's own user home. `/home/runner` there is created by
+# that Dockerfile's `useradd -m runner` and is a fixed path INSIDE an image we
+# build — not a path on anyone's machine, which is what this check is for.
+file:scripts/ci/agent-runner/**
