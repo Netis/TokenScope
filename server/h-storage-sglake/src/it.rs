@@ -2013,3 +2013,136 @@ async fn a_write_against_a_dead_sglogd_errors_and_recovers() {
         .await;
     }
 }
+
+/// Stored bodies must still be readable when sglogd has a props.toml.
+///
+/// Every other test in this file runs against a sglogd with **no props.toml**,
+/// which is not a configuration anyone deploys — `docs/design/10-sglake.md` and
+/// `heron sglake-props` both tell the operator to install one. That gap hid a
+/// total failure of the body read path: the body indexes are written as
+/// pre-serialized JSON strings with `auto_json = false`, so they have no
+/// extracted fields, and the lookups asked for `span_id="…"`. Without props
+/// that still matched (sglake fell back to matching the raw event); with props
+/// loaded it matched nothing, so every Request/Response body in the console was
+/// empty — and slow, because a miss sends `fetch_raw_by_id` into its unbounded
+/// retry across the whole retention window.
+///
+/// So this test owns its sglogd specifically to write props.toml into the data
+/// directory before starting it. Gated on `SGLAKE_SGLOGD_BIN` like the fault
+/// injection above, for the same reason: it spawns a process.
+#[tokio::test]
+async fn bodies_are_readable_when_sglogd_has_props() {
+    let Ok(bin) = std::env::var("SGLAKE_SGLOGD_BIN") else {
+        eprintln!("skip: SGLAKE_SGLOGD_BIN unset");
+        return;
+    };
+    let nonce = uuid::Uuid::now_v7().simple().to_string();
+    let mut sg = OwnedSglogd {
+        bin,
+        web_dir: None,
+        dir: std::env::temp_dir().join(format!("sglake-props-{}", &nonce[..12])),
+        port: 40000 + (u16::from_str_radix(&nonce[..4], 16).unwrap_or(0) % 20000),
+        child: None,
+    };
+    std::fs::create_dir_all(&sg.dir).unwrap();
+    // The whole point of the test: the daemon starts holding the extraction
+    // config Heron itself tells operators to install.
+    std::fs::write(sg.dir.join("props.toml"), crate::props::render()).unwrap();
+    sg.spawn();
+    sg.wait_ready().await;
+
+    let cfg = SglakeConfig {
+        url: sg.url(),
+        hec_token: "heron-fault".into(),
+        index_prefix: format!("prp{}", &nonce[..12]),
+        request_timeout_secs: 5,
+        search_timeout_secs: 30,
+        ..Default::default()
+    };
+    let backend = SglakeBackend::new(&cfg).unwrap();
+    backend.init().await.unwrap();
+
+    let base = 1_770_000_000_000_000i64;
+
+    let mut call = fixtures::full_call();
+    call.id = uuid::Uuid::now_v7().to_string();
+    call.request_time = base;
+    let call_id = call.id.clone();
+    let want_request = call.request_body.clone();
+    let want_response = call.response_body.clone();
+    assert!(
+        want_request.is_some() && want_response.is_some(),
+        "the fixture must carry bodies or this test proves nothing"
+    );
+    backend.write_spans(vec![call]).await.unwrap();
+
+    let exchange_id = uuid::Uuid::now_v7().to_string();
+    backend
+        .write_exchanges(vec![sample_exchange(&exchange_id, base)])
+        .await
+        .unwrap();
+
+    let backend = &backend;
+    let detail = eventually("the span with its body", || async {
+        backend.query_span_by_id(&call_id).await.unwrap()
+    })
+    .await;
+    assert_eq!(
+        detail.request_body, want_request,
+        "the span's request body came back empty — the body index lookup is not matching"
+    );
+    assert_eq!(detail.response_body, want_response);
+
+    let exchange = eventually("the exchange with its body", || async {
+        backend
+            .query_http_exchange_by_id(&exchange_id)
+            .await
+            .unwrap()
+    })
+    .await;
+    assert_eq!(
+        exchange.request_body.as_deref(),
+        Some(r#"{"model":"gpt-4"}"#),
+        "the exchange's request body came back empty"
+    );
+    assert_eq!(
+        exchange.response_body.as_deref(),
+        Some(r#"{"choices":[]}"#)
+    );
+
+    // A trace whose spans are spread over more than one lookup window must
+    // come back with ALL of its bodies. This is the failure mode a windowed
+    // multi-id lookup has and a single-id one does not: the ids inside the
+    // window hit, the query returns non-empty, and the ids outside it are
+    // dropped — so the answer looks complete and is not. Observed as 90 of 184
+    // bodies on a live trace the moment the window was narrowed.
+    let spread: Vec<h_llm::model::LlmCall> = (0..6)
+        .map(|i| {
+            let mut c = fixtures::full_call();
+            c.id = uuid::Uuid::now_v7().to_string();
+            // 10 minutes apart: wider than the narrow window, so a lookup that
+            // stops at the first window that returns anything will miss most.
+            c.request_time = base + i * 600 * 1_000_000;
+            c
+        })
+        .collect();
+    let spread_ids: Vec<String> = spread.iter().map(|c| c.id.clone()).collect();
+    backend.write_spans(spread).await.unwrap();
+
+    let all = eventually("every span in the spread set", || async {
+        let got = backend
+            .query_spans_by_ids(&spread_ids, true)
+            .await
+            .unwrap();
+        (got.len() == spread_ids.len()).then_some(got)
+    })
+    .await;
+    let with_bodies = all.iter().filter(|s| s.request_body.is_some()).count();
+    assert_eq!(
+        with_bodies,
+        spread_ids.len(),
+        "only {with_bodies} of {} spans came back with a body — a partial \
+         window miss reports success",
+        spread_ids.len()
+    );
+}

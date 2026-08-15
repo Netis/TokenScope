@@ -48,6 +48,42 @@ pub(crate) fn match_term(field: &str, value: &str) -> Option<String> {
     }
 }
 
+/// A body-index lookup term for one span id.
+///
+/// The body indexes are the one place a field predicate does not work. Their
+/// events are delivered as pre-serialized JSON *strings* with `auto_json =
+/// false`, so sglake extracts no fields from them at all — `span_id="…"`
+/// compares against a field that does not exist and matches nothing, silently,
+/// while still paying for the scan. (Whether it matches also depends on whether
+/// a props.toml is loaded, which is why this survived a test suite that ran
+/// without one.)
+///
+/// So the lookup is a raw term instead, anchored on the leading key. The body
+/// event is written with `span_id` first precisely so this anchor exists: the
+/// raw text always begins `{"span_id":"<id>"`, and a bare id term would also
+/// match a body whose *content* happens to quote that id — this cannot, because
+/// inside a nested body the quotes are escaped.
+///
+/// `None` when the id contains `*`, which no UUID does; the caller must treat
+/// that as "no lookup" rather than "match everything".
+pub(crate) fn body_term(span_id: &str) -> Option<String> {
+    if needs_literal_compare(span_id) {
+        return None;
+    }
+    Some(quote(&format!("{{\"span_id\":\"{span_id}\"")))
+}
+
+/// `("<a>" OR "<b>")` over [`body_term`], for the chunked second hop. Ids that
+/// cannot be termed are dropped; `None` when that leaves nothing to search for.
+pub(crate) fn body_terms(span_ids: &[String]) -> Option<String> {
+    let terms: Vec<String> = span_ids.iter().filter_map(|id| body_term(id)).collect();
+    match terms.len() {
+        0 => None,
+        1 => terms.into_iter().next(),
+        _ => Some(format!("({})", terms.join(" OR "))),
+    }
+}
+
 /// `field IN ("a", "b")` — equivalent to an OR chain but parsed as one node.
 /// Returns `None` for an empty list (the caller must decide whether that means
 /// "no filter" or "match nothing"; those are different and must not be
@@ -282,10 +318,24 @@ pub(crate) fn raw_query(search: &str, limit: usize) -> String {
     format!("{search} | head {limit} | table _raw")
 }
 
-/// Widen a point lookup's time window by this much on each side, in
-/// microseconds. Covers clock skew between the capture host and the id
-/// minting, plus a turn that is still open when its id is generated.
-const ID_WINDOW_SKEW_US: i64 = 6 * 3_600_000_000;
+/// How far a point lookup widens its time window, in microseconds, tried in
+/// this order until one produces a hit.
+///
+/// The window is only ever a hint — [`id_windows`] explains why it can miss —
+/// so the question is not "how wide must it be to be right" but "how wide
+/// before it stops paying for itself". Measured against a live store, a point
+/// lookup costs what its window costs and almost nothing else: ±60s answered in
+/// 0.04s, ±5m in 0.21s, ±6h in 1.17s. A single wide window therefore put ~2s of
+/// floor under every span detail (metadata lookup plus body lookup) to buy skew
+/// tolerance that essentially no deployment needs.
+///
+/// Narrow first, then wide, then unbounded. A live capture — where the id is
+/// minted milliseconds after the packet — hits the narrow window and pays 0.2s.
+/// A host with badly skewed clocks pays the narrow miss and then hits the wide
+/// one, which is what it used to pay anyway. Replay, where id time and packet
+/// time are years apart, misses both and falls to the unbounded retry, which is
+/// also what it used to do — the ±6h window never covered that case either.
+const ID_WINDOW_SKEW_US: &[i64] = &[5 * 60_000_000, 6 * 3_600_000_000];
 
 /// Best-effort `(earliest, latest)` derived from a UUIDv7's embedded
 /// millisecond timestamp.
@@ -302,20 +352,68 @@ const ID_WINDOW_SKEW_US: i64 = 6 * 3_600_000_000;
 ///   from the packet. Replaying a captured pcap makes those years apart, so
 ///   the derived window would exclude the very event it is looking for —
 ///   which is exactly how the test corpus and the staging soak run.
-pub(crate) fn id_window(id: &str) -> Option<(String, String)> {
-    let uuid = uuid::Uuid::parse_str(id).ok()?;
-    let ts = uuid.get_timestamp()?;
-    let (secs, nanos) = ts.to_unix();
-    let us = i64::try_from(secs).ok()?.checked_mul(1_000_000)? + (nanos / 1000) as i64;
-    Some((
-        epoch_secs(us.saturating_sub(ID_WINDOW_SKEW_US)),
-        epoch_secs(us.saturating_add(ID_WINDOW_SKEW_US)),
-    ))
+pub(crate) fn id_windows(id: &str) -> Vec<(String, String)> {
+    let Some(us) = uuid::Uuid::parse_str(id)
+        .ok()
+        .and_then(|u| u.get_timestamp())
+        .and_then(|ts| {
+            let (secs, nanos) = ts.to_unix();
+            Some(i64::try_from(secs).ok()?.checked_mul(1_000_000)? + (nanos / 1000) as i64)
+        })
+    else {
+        return Vec::new();
+    };
+    ID_WINDOW_SKEW_US
+        .iter()
+        .map(|skew| {
+            (
+                epoch_secs(us.saturating_sub(*skew)),
+                epoch_secs(us.saturating_add(*skew)),
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The body term is anchored on the leading key, so an id that merely
+    /// appears *inside* a stored body cannot match it: within a nested body the
+    /// quotes are escaped, so the literal `{"span_id":"<id>"` never occurs
+    /// there. Losing the anchor would reintroduce that confusion silently.
+    #[test]
+    fn body_term_anchors_on_the_leading_key() {
+        let t = body_term("01a0-7bf0").expect("a uuid is termable");
+        assert_eq!(t, r#""{\"span_id\":\"01a0-7bf0\"""#);
+        assert!(
+            !t.contains("span_id=") && !t.contains(" IN "),
+            "must be a raw term, not a field predicate — the body indexes have \
+             no extracted fields to compare against: {t}"
+        );
+    }
+
+    #[test]
+    fn body_terms_ors_the_chunk_and_refuses_an_empty_one() {
+        assert_eq!(body_terms(&[]), None);
+        let one = body_terms(&["a".to_string()]).unwrap();
+        assert!(!one.starts_with('('), "a single id needs no OR group: {one}");
+        let two = body_terms(&["a".to_string(), "b".to_string()]).unwrap();
+        assert!(two.starts_with('(') && two.contains(" OR "), "{two}");
+    }
+
+    /// A `*` cannot be a search term, and answering `None` must mean "look
+    /// nothing up" rather than degrading into a term that matches every body.
+    #[test]
+    fn body_term_refuses_a_wildcard_id() {
+        assert_eq!(body_term("01a0-*"), None);
+        assert_eq!(body_terms(&["01a0-*".to_string()]), None);
+        let mixed = body_terms(&["01a0-*".to_string(), "real".to_string()]).unwrap();
+        assert!(
+            mixed.contains("real") && !mixed.contains('*'),
+            "the termable id survives, the wildcard one is dropped: {mixed}"
+        );
+    }
 
     #[test]
     fn quote_escapes_quote_and_backslash_only() {

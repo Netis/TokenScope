@@ -28,7 +28,7 @@ use h_storage::query::{
 use crate::calls::ms;
 use crate::read::Sort;
 use crate::rows::{http_events, Envelope, HttpBodyEvent, HttpEvent, ST_HTTP, ST_HTTP_BODY};
-use crate::spl::{match_term, Search};
+use crate::spl::{self, match_term, Search};
 use crate::SglakeBackend;
 
 /// `duration_ms` is not stored — it is `done_us - ts_us`, computed by an
@@ -145,14 +145,17 @@ impl SglakeBackend {
 
         let body = if e.has_body {
             let bix = &self.ix.http_bodies;
-            let Some(bterm) = match_term("span_id", id) else {
+            // Raw term, not a field predicate: the body indexes carry no
+            // extracted fields at all, so `span_id="…"` matches nothing here.
+            // See `spl::body_term`.
+            let Some(bterm) = spl::body_term(id) else {
                 return Ok(None);
             };
             let bsearch = format!("search index={bix} sourcetype={ST_HTTP_BODY} {bterm}");
             self.fetch_raw_by_id::<HttpBodyEvent>("query_http_exchange_body", &bsearch, 1, id)
                 .await?
                 .into_iter()
-                .next()
+                .find(|b| b.span_id == id)
         } else {
             None
         };

@@ -9,7 +9,7 @@
 //! partial failure can leave a span without its body (the console then shows
 //! the body as unavailable) but never a body without its span.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use h_common::error::Result;
 use h_common::process::ProcessInfo;
@@ -18,7 +18,7 @@ use h_storage::query::{SpanDetail, SpanListItem, SpansPage, SpansQuery, TraceSpa
 
 use crate::read::Sort;
 use crate::rows::{span_events, BodyEvent, Envelope, SpanEvent, ST_BODY, ST_SPAN};
-use crate::spl::{in_list, match_term, Search, ID_CHUNK};
+use crate::spl::{self, in_list, match_term, Search, ID_CHUNK};
 use crate::SglakeBackend;
 
 /// Microseconds → milliseconds, the unit the detail and trace-span types use.
@@ -29,6 +29,30 @@ pub(crate) fn ms(us: i64) -> i64 {
 
 /// Ceiling on the id set used to resolve the traces `server_port` filter.
 const PORT_FILTER_ID_CAP: usize = 50_000;
+
+/// Slack on each side of a body lookup's window, in microseconds. A body is
+/// written with its span's own timestamp, so this covers nothing but the
+/// second-boundary rounding in the search bounds.
+const BODY_WINDOW_PAD_US: i64 = 2_000_000;
+
+/// The `_time` extent to look for these spans' bodies in.
+///
+/// Bodies are written with the same timestamp as the span they belong to, so
+/// the spans — already in hand by the time bodies are wanted — bound the search
+/// exactly. An empty slice yields an unbounded window, which is only reachable
+/// with nothing to look up.
+fn body_window(events: &[SpanEvent]) -> (String, String) {
+    let (Some(min), Some(max)) = (
+        events.iter().map(|e| e.ts_us).min(),
+        events.iter().map(|e| e.ts_us).max(),
+    ) else {
+        return ("0".to_string(), "0".to_string());
+    };
+    (
+        spl::epoch_secs(min.saturating_sub(BODY_WINDOW_PAD_US)),
+        spl::epoch_secs(max.saturating_add(BODY_WINDOW_PAD_US)),
+    )
+}
 
 fn span_list_item(e: SpanEvent) -> SpanListItem {
     SpanListItem {
@@ -179,7 +203,9 @@ impl SglakeBackend {
         };
 
         let body = if e.has_body {
-            self.fetch_bodies(&[id.to_string()]).await?.remove(id)
+            self.fetch_bodies(&[id.to_string()], body_window(std::slice::from_ref(&e)))
+                .await?
+                .remove(id)
         } else {
             None
         };
@@ -291,7 +317,13 @@ impl SglakeBackend {
 
         let mut bodies = if include_bodies {
             let ids: Vec<String> = events.iter().map(|e| e.id.clone()).collect();
-            self.fetch_bodies(&ids).await?
+            // Exact window, taken from the spans just read: a body carries the
+            // same `_time` as its span, so their extent is the only bound the
+            // lookup needs. Deriving one from the ids instead would be a guess
+            // — and a guess that fails partially, dropping the bodies of spans
+            // outside it while the ones inside make the query look successful.
+            let span = body_window(&events);
+            self.fetch_bodies(&ids, span).await?
         } else {
             HashMap::new()
         };
@@ -375,19 +407,40 @@ impl SglakeBackend {
 
     /// Second hop of the no-JOIN read: bodies for a set of span ids, keyed by
     /// span id. Missing ids are simply absent from the map.
-    async fn fetch_bodies(&self, span_ids: &[String]) -> Result<HashMap<String, BodyEvent>> {
+    ///
+    /// Matched by raw term, not by field — see [`spl::body_term`] for why a
+    /// field predicate silently matches nothing here. The term is anchored on
+    /// the leading key, and the deserialized `span_id` is checked against the
+    /// requested set anyway, so nothing that merely quotes an id can be
+    /// mistaken for the body of that span.
+    ///
+    /// `window` is the `_time` extent of the spans these bodies belong to, and
+    /// the caller always knows it, because it has just read those spans. That
+    /// matters more than it looks: the id-derived window is a *hint* whose miss
+    /// path is "retry unbounded", and a hint that half-misses over a set of ids
+    /// returns a partial answer that no caller can distinguish from a complete
+    /// one.
+    async fn fetch_bodies(
+        &self,
+        span_ids: &[String],
+        window: (String, String),
+    ) -> Result<HashMap<String, BodyEvent>> {
         let mut out = HashMap::with_capacity(span_ids.len());
+        let (earliest, latest) = window;
         for chunk in span_ids.chunks(ID_CHUNK) {
             let ix = &self.ix.bodies;
-            let Some(list) = in_list("span_id", chunk) else {
+            let Some(terms) = spl::body_terms(chunk) else {
                 continue;
             };
-            let search = format!("search index={ix} sourcetype={ST_BODY} {list}");
+            let search = format!("search index={ix} sourcetype={ST_BODY} {terms}");
+            let wanted: HashSet<&str> = chunk.iter().map(String::as_str).collect();
             let found: Vec<BodyEvent> = self
-                .fetch_raw_by_id("fetch_bodies", &search, chunk.len(), &chunk[0])
+                .fetch_raw("fetch_bodies", &search, chunk.len(), &earliest, &latest)
                 .await?;
             for b in found {
-                out.insert(b.span_id.clone(), b);
+                if wanted.contains(b.span_id.as_str()) {
+                    out.insert(b.span_id.clone(), b);
+                }
             }
         }
         Ok(out)

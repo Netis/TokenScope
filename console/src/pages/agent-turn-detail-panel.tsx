@@ -195,10 +195,15 @@ function TabButton({
 /// mode — server NULLs the four heavy body/header fields so a
 /// mega-turn (hundreds of agentic iterations × hundreds of KB
 /// request_body each) doesn't OOM the browser. Individual call bodies
-/// are still reachable per-card via `useLlmCallDetail`. Threshold is
-/// empirical: a 100-call turn round-trips in well under a second; a
-/// 300-call turn (~60 MB at p50 body size) starts dropping frames.
-const CALLS_LITE_THRESHOLD = 200
+/// are still reachable per-card via `useLlmCallDetail`.
+///
+/// The threshold was set from browser-side cost alone, which is only half the
+/// bill. Measured against a live store, a 184-call turn takes ~6s to answer
+/// with bodies and ~0.9s without, while one card's lazy body costs ~0.2-0.9s —
+/// so at 200 the panel spends seconds fetching bodies for cards the reader has
+/// not opened and may never open. 50 keeps the eager path around a second and
+/// defers the rest to the cards that actually get expanded.
+const CALLS_LITE_THRESHOLD = 50
 
 export function AgentTurnDetailPanel({ id, onClose }: Props) {
   const { data: turn, isLoading: loadingTurn, isError: errorTurn } = useAgentTurnDetail(id)
