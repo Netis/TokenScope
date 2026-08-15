@@ -145,19 +145,31 @@ impl ClickHouseBackend {
         // Time-range + filter WHERE. Timestamps and numeric ports are
         // interpolated (values we control); user string lists go through
         // `sql_in_list`'s single-quote escaping, valid in ClickHouse.
-        let mut where_parts =
-            vec![time_where("request_time", query.time_range.start_us, query.time_range.end_us)];
+        let mut where_parts = vec![time_where(
+            "request_time",
+            query.time_range.start_us,
+            query.time_range.end_us,
+        )];
         if !query.filter.wire_apis.is_empty() {
-            where_parts.push(format!("wire_api IN ({})", sql_in_list(&query.filter.wire_apis)));
+            where_parts.push(format!(
+                "wire_api IN ({})",
+                sql_in_list(&query.filter.wire_apis)
+            ));
         }
         if !query.filter.models.is_empty() {
             where_parts.push(format!("model IN ({})", sql_in_list(&query.filter.models)));
         }
         if !query.filter.server_ips.is_empty() {
-            where_parts.push(format!("server_ip IN ({})", sql_in_list(&query.filter.server_ips)));
+            where_parts.push(format!(
+                "server_ip IN ({})",
+                sql_in_list(&query.filter.server_ips)
+            ));
         }
         if !query.status_codes.is_empty() {
-            where_parts.push(format!("status_code IN ({})", join_nums(&query.status_codes)));
+            where_parts.push(format!(
+                "status_code IN ({})",
+                join_nums(&query.status_codes)
+            ));
         }
         if !query.finish_reasons.is_empty() {
             where_parts.push(format!(
@@ -169,7 +181,10 @@ impl ClickHouseBackend {
             where_parts.push(format!("client_ip IN ({})", sql_in_list(&query.client_ips)));
         }
         if !query.server_ports.is_empty() {
-            where_parts.push(format!("server_port IN ({})", join_nums(&query.server_ports)));
+            where_parts.push(format!(
+                "server_port IN ({})",
+                join_nums(&query.server_ports)
+            ));
         }
         if let Some(substr) = query
             .request_path_contains
@@ -200,7 +215,7 @@ impl ClickHouseBackend {
              response_body, is_agent_request, tool_surface, agent_topology, tool_call_count, \
              tool_names_json, process_pid, process_comm, process_exe \
              FROM spans WHERE {where_sql} \
-             ORDER BY {} {sort_order} LIMIT {} OFFSET {offset}",
+             ORDER BY {} {sort_order}, id ASC LIMIT {} OFFSET {offset}",
             query.sort_by, query.page_size,
         );
         let rows = self

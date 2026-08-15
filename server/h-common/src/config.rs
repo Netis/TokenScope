@@ -529,6 +529,8 @@ pub struct StorageConfig {
     #[serde(default)]
     pub clickhouse: ClickHouseConfig,
     #[serde(default)]
+    pub sglake: SglakeConfig,
+    #[serde(default)]
     pub sink: StorageSinkConfig,
     #[serde(default)]
     pub retention: RetentionConfig,
@@ -540,6 +542,7 @@ impl Default for StorageConfig {
             backend: default_backend(),
             duckdb: DuckDbConfig::default(),
             clickhouse: ClickHouseConfig::default(),
+            sglake: SglakeConfig::default(),
             sink: StorageSinkConfig::default(),
             retention: RetentionConfig::default(),
         }
@@ -732,6 +735,179 @@ fn default_clickhouse_database() -> String {
 
 fn default_clickhouse_user() -> String {
     "default".to_string()
+}
+
+/// Connection + behaviour settings for the sglake (sglog) storage backend.
+/// Only read when `storage.backend == "sglake"`.
+///
+/// Writes go through the Splunk-compatible HEC (`/services/collector/event`);
+/// reads are SPL over `/api/v1/search`. Heron's five tables map onto a set of
+/// sglake indexes under `index_prefix`: `_spans` / `_bodies` / `_traces` /
+/// `_metrics_<granularity>` / `_finish_<granularity>` / `_http` /
+/// `_http_bodies`. Bodies live in their own indexes so list and aggregate
+/// queries never touch body bytes, and so bodies can expire earlier than the
+/// metadata that references them.
+///
+/// ⚠️ Security: sglogd authenticates HEC with a token but leaves `/api/v1/*`
+/// **unauthenticated**, and serves no HTTPS of its own. Deploy it on a trusted
+/// network or behind a reverse proxy.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SglakeConfig {
+    /// sglogd base URL, e.g. `http://127.0.0.1:5959`.
+    #[serde(default = "default_sglake_url")]
+    pub url: String,
+    /// HEC token. Only needed when sglogd runs with `--hec-token`; the header
+    /// is matched exactly as `Authorization: Splunk <token>`.
+    #[serde(default)]
+    pub hec_token: String,
+    /// Prefix for every index this backend owns. Must avoid sglake's built-in
+    /// names (`main` / `traces` / `metrics` / `summary` / `_internal` / `_audit`)
+    /// — note `traces` in particular is already taken by OTLP spans.
+    #[serde(default = "default_sglake_index_prefix")]
+    pub index_prefix: String,
+    /// Persist request/response bodies and headers. `false` keeps only
+    /// metadata, which is the cheapest possible footprint.
+    #[serde(default = "default_true")]
+    pub store_bodies: bool,
+    /// Retention for the body indexes, in days. `0` inherits
+    /// `storage.retention.spans`.
+    #[serde(default)]
+    pub body_retention_days: u32,
+    /// Push per-index retention to sglake's management API on
+    /// `apply_retention`. When false the call is a no-op and retention is left
+    /// to whoever operates sglogd.
+    #[serde(default = "default_true")]
+    pub manage_retention: bool,
+    /// Max bytes per HEC request, pre-compression. Must stay below sglogd's
+    /// `--max-body-mib` (default 100 MiB) — the limit is enforced on the
+    /// *decompressed* size, so gzip does not buy headroom.
+    #[serde(default = "default_sglake_max_body_bytes")]
+    pub max_body_bytes: usize,
+    /// Hard ceiling for a single event, pre-compression. Must stay below
+    /// sglake's 16 MiB WAL frame limit: an oversized event is discarded as
+    /// corruption during crash replay, which is the worst failure mode there
+    /// is. `[body_cap]` normally keeps bodies far below this; this is the only
+    /// guard when `body_cap.enabled = false`.
+    #[serde(default = "default_sglake_max_event_bytes")]
+    pub max_event_bytes: usize,
+    /// gzip HEC request bodies.
+    #[serde(default = "default_true")]
+    pub gzip: bool,
+    /// Use HEC indexer acknowledgement to avoid duplicate writes when a
+    /// request fails after the server already committed it.
+    #[serde(default = "default_true")]
+    pub use_ack: bool,
+    #[serde(default = "default_sglake_write_retries")]
+    pub write_retries: u32,
+    #[serde(default = "default_sglake_retry_backoff_ms")]
+    pub retry_backoff_ms: u64,
+    #[serde(default = "default_sglake_request_timeout_secs")]
+    pub request_timeout_secs: u64,
+    #[serde(default = "default_sglake_search_timeout_secs")]
+    pub search_timeout_secs: u64,
+    /// Deep-pagination ceiling. SPL has no offset/cursor, so a page at offset
+    /// N costs `sort N`; past this the backend errors out rather than silently
+    /// truncating.
+    #[serde(default = "default_sglake_max_page_offset")]
+    pub max_page_offset: u64,
+    /// Guard for the session-list scan, which must materialize one row per
+    /// session in the window before it can page.
+    #[serde(default = "default_sglake_max_sessions_scan")]
+    pub max_sessions_scan: u64,
+    /// Concurrency limit for the multi-request read paths (id-chunked point
+    /// lookups, the three-step session list).
+    #[serde(default = "default_sglake_max_concurrent_searches")]
+    pub max_concurrent_searches: usize,
+    /// A trace's `_time` is its start; queries that filter on end time widen
+    /// the search window by this much so bucket pruning stays correct.
+    #[serde(default = "default_sglake_trace_time_skew_hours")]
+    pub trace_time_skew_hours: u32,
+    /// Deduplicate metric rows on read by `row_id`. Off by default: writes are
+    /// at-least-once but duplicates are rare, and `dedup` costs a full sort.
+    /// Turn it on if duplicate metric rows are ever observed.
+    #[serde(default)]
+    pub metrics_dedup: bool,
+    /// Emulate updates to `traces` by appending a new revision and
+    /// deduplicating on read. Off by default because it forces every traces
+    /// read onto a full-window sort, which defeats the pagination design; see
+    /// the crate docs for what stays broken while it is off (proxy pairing).
+    #[serde(default)]
+    pub enable_trace_patching: bool,
+}
+
+impl Default for SglakeConfig {
+    fn default() -> Self {
+        Self {
+            url: default_sglake_url(),
+            hec_token: String::new(),
+            index_prefix: default_sglake_index_prefix(),
+            store_bodies: true,
+            body_retention_days: 0,
+            manage_retention: true,
+            max_body_bytes: default_sglake_max_body_bytes(),
+            max_event_bytes: default_sglake_max_event_bytes(),
+            gzip: true,
+            use_ack: true,
+            write_retries: default_sglake_write_retries(),
+            retry_backoff_ms: default_sglake_retry_backoff_ms(),
+            request_timeout_secs: default_sglake_request_timeout_secs(),
+            search_timeout_secs: default_sglake_search_timeout_secs(),
+            max_page_offset: default_sglake_max_page_offset(),
+            max_sessions_scan: default_sglake_max_sessions_scan(),
+            max_concurrent_searches: default_sglake_max_concurrent_searches(),
+            trace_time_skew_hours: default_sglake_trace_time_skew_hours(),
+            metrics_dedup: false,
+            enable_trace_patching: false,
+        }
+    }
+}
+
+fn default_sglake_url() -> String {
+    "http://127.0.0.1:5959".to_string()
+}
+
+fn default_sglake_index_prefix() -> String {
+    "heron".to_string()
+}
+
+fn default_sglake_max_body_bytes() -> usize {
+    32 * 1024 * 1024
+}
+
+fn default_sglake_max_event_bytes() -> usize {
+    8 * 1024 * 1024
+}
+
+fn default_sglake_write_retries() -> u32 {
+    3
+}
+
+fn default_sglake_retry_backoff_ms() -> u64 {
+    200
+}
+
+fn default_sglake_request_timeout_secs() -> u64 {
+    120
+}
+
+fn default_sglake_search_timeout_secs() -> u64 {
+    120
+}
+
+fn default_sglake_max_page_offset() -> u64 {
+    100_000
+}
+
+fn default_sglake_max_sessions_scan() -> u64 {
+    200_000
+}
+
+fn default_sglake_max_concurrent_searches() -> usize {
+    8
+}
+
+fn default_sglake_trace_time_skew_hours() -> u32 {
+    24
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1043,6 +1219,31 @@ pub enum ConfigIssue {
     /// Only emitted when `spans_days > 0` — infinite calls retention can
     /// satisfy any turns retention.
     TracesRetentionExceedsSpans { traces_days: u32, spans_days: u32 },
+    /// `storage.sglake.index_prefix` is not a usable index-name token, so the
+    /// backend would write under names nobody expects — an empty prefix in
+    /// particular lands in sglake's own leading-underscore namespace. Only
+    /// emitted when `storage.backend == "sglake"`.
+    SglakeReservedIndexPrefix { prefix: String, index: String },
+    /// `storage.sglake.max_event_bytes` is smaller than a single capped body
+    /// can be, so full-size events are dropped before they are ever sent.
+    /// That is silent data loss at steady state, not an edge case. Only
+    /// emitted when `storage.backend == "sglake"`.
+    SglakeEventCapBelowBodyCap {
+        max_event_bytes: usize,
+        body_cap_bytes: usize,
+    },
+    /// Body indexes are set to outlive the span metadata that points at them,
+    /// leaving bodies nothing can reach. `0` means "inherit", which is always
+    /// consistent. Only emitted when `storage.backend == "sglake"`.
+    /// `storage.sglake.url` names a host other than loopback.
+    SglakeUrlNotLoopback { url: String, host: String },
+    SglakeBodyRetentionExceedsParent {
+        body_days: u32,
+        /// Which entity's retention the bodies would outlive — `spans` for the
+        /// LLM-call bodies index, `http_exchanges` for the HTTP one.
+        parent: String,
+        parent_days: u32,
+    },
 }
 
 impl ConfigIssue {
@@ -1054,13 +1255,19 @@ impl ConfigIssue {
         match self {
             Self::NoPipelines
             | Self::NoSourcesInPipeline { .. }
-            | Self::PcapDumpRetentionNoRules { .. } => IssueSeverity::Warn,
+            | Self::PcapDumpRetentionNoRules { .. }
+            // Orphaned bodies waste space but break nothing: the metadata
+            // rows that would reference them are already gone.
+            | Self::SglakeUrlNotLoopback { .. }
+            | Self::SglakeBodyRetentionExceedsParent { .. } => IssueSeverity::Warn,
             Self::DuplicatePipelineName(_)
             | Self::DuplicateSourceId { .. }
             | Self::StoragePathParentUnwritable { .. }
             | Self::UnknownRetentionGranularity(_)
             | Self::UnsafePcapDumpPipelineName { .. }
-            | Self::TracesRetentionExceedsSpans { .. } => IssueSeverity::Error,
+            | Self::TracesRetentionExceedsSpans { .. }
+            | Self::SglakeReservedIndexPrefix { .. }
+            | Self::SglakeEventCapBelowBodyCap { .. } => IssueSeverity::Error,
         }
     }
 }
@@ -1144,6 +1351,45 @@ impl std::fmt::Display for ConfigIssue {
                      lists. Set traces <= spans (or set spans = 0 for infinite)."
                 )
             }
+            Self::SglakeReservedIndexPrefix { prefix, index } => write!(
+                f,
+                "storage.sglake.index_prefix '{prefix}' is not a usable index \
+                 name token (it would produce '{index}'). Use lowercase \
+                 letters, digits and underscores, and do not start with '_' \
+                 — that is sglake's own namespace."
+            ),
+            Self::SglakeEventCapBelowBodyCap {
+                max_event_bytes,
+                body_cap_bytes,
+            } => write!(
+                f,
+                "storage.sglake.max_event_bytes ({max_event_bytes}) is below \
+                 the {body_cap_bytes} bytes a capped body can reach, so \
+                 full-size events would be dropped before being sent. Raise \
+                 max_event_bytes or lower [body_cap]."
+            ),
+            Self::SglakeUrlNotLoopback { url, host } => write!(
+                f,
+                "storage.sglake.url points at '{host}' ({url}). sglake's \
+                 /api/v1/* search endpoints have no authentication of their \
+                 own — every stored request and response body is readable by \
+                 anyone who can reach that port, and Heron cannot restrict \
+                 it. Bind sglogd to 127.0.0.1, or put the link on a network \
+                 only Heron can use."
+            ),
+            Self::SglakeBodyRetentionExceedsParent {
+                body_days,
+                parent,
+                parent_days,
+            } => write!(
+                f,
+                "storage.sglake.body_retention_days ({body_days}d) outlives \
+                 storage.retention.{parent} ({parent_days}d): bodies will \
+                 survive the metadata that points at them and become \
+                 unreachable, since every read finds a body through its \
+                 parent's id. Set body_retention_days <= {parent} (or 0 to \
+                 inherit each body index's own parent)."
+            ),
         }
     }
 }
@@ -1159,6 +1405,41 @@ impl std::fmt::Display for ConfigIssue {
 /// Empty paths and parent-of-relative-paths that bottom out to "" are
 /// normalized to `.` so a relative `data/foo.duckdb` whose `data/` doesn't
 /// yet exist still probes the cwd (which is what `mkdir -p data` would do).
+/// Host portion of a `scheme://host[:port][/path]` URL, lowercased.
+///
+/// Deliberately not a URL parser: the only question is which host the operator
+/// named, and pulling in a dependency to answer it — or failing closed on a
+/// shape a real parser would reject — would both be worse than saying nothing.
+/// An unparseable URL returns `None` and is left to fail at connect time with
+/// a message about the actual problem.
+fn sglake_url_host(url: &str) -> Option<String> {
+    let rest = url.split("://").nth(1)?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    // Strip userinfo, then the port — but not the colons inside a bracketed
+    // IPv6 literal.
+    let authority = authority.rsplit('@').next()?;
+    let host = if let Some(end) = authority.find(']') {
+        &authority[..=end]
+    } else {
+        authority.split(':').next()?
+    };
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+}
+
+/// Whether a host names this machine only.
+fn is_loopback_host(host: &str) -> bool {
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if bare == "localhost" {
+        return true;
+    }
+    match bare.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.is_loopback(),
+        // A name that is not an address could resolve anywhere; only the
+        // conventional one is treated as local.
+        Err(_) => false,
+    }
+}
+
 fn is_writable_dir(dir: &Path) -> bool {
     let mut probe_root = if dir.as_os_str().is_empty() {
         PathBuf::from(".")
@@ -1280,6 +1561,70 @@ impl AppConfig {
                 traces_days,
                 spans_days,
             });
+        }
+
+        if self.storage.backend == "sglake" {
+            let sg = &self.storage.sglake;
+            // sglake has no DDL — an index exists because something wrote to
+            // it — so a malformed prefix is never rejected by the store. It
+            // just starts writing under a name nobody expects. The exact
+            // reserved-name collision check lives in the backend, which owns
+            // index naming; what this layer can check is that the prefix is a
+            // usable token at all. An empty prefix in particular yields
+            // `_spans`, and leading-underscore indexes are sglake's own
+            // namespace.
+            let prefix = sg.index_prefix.as_str();
+            if prefix.is_empty()
+                || !prefix
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                || prefix.starts_with('_')
+            {
+                issues.push(ConfigIssue::SglakeReservedIndexPrefix {
+                    prefix: sg.index_prefix.clone(),
+                    index: format!("{prefix}_spans"),
+                });
+            }
+            // The search API sglake exposes is unauthenticated, so where it
+            // listens is the entire access control story for the bodies Heron
+            // stores there. Heron does not start sglogd and cannot bind it, so
+            // this is the one place the risk can be named — and a non-loopback
+            // URL is the observable symptom of it.
+            if let Some(host) = sglake_url_host(&sg.url) {
+                if !is_loopback_host(&host) {
+                    issues.push(ConfigIssue::SglakeUrlNotLoopback {
+                        url: sg.url.clone(),
+                        host,
+                    });
+                }
+            }
+            // A body at the cap plus its headers and JSON escaping has to fit
+            // in one event, or the write path drops it every time.
+            if self.body_cap.enabled {
+                let body_cap_bytes = self.body_cap.head_bytes + self.body_cap.tail_bytes;
+                if sg.store_bodies && sg.max_event_bytes < body_cap_bytes {
+                    issues.push(ConfigIssue::SglakeEventCapBelowBodyCap {
+                        max_event_bytes: sg.max_event_bytes,
+                        body_cap_bytes,
+                    });
+                }
+            }
+            // Bodies live in their own indexes and, when given an explicit
+            // retention, use it for both of them. Outliving *either* parent
+            // strands bodies that nothing can reach — a body is only ever
+            // found through its parent's id.
+            for (parent, days) in [
+                ("spans", self.storage.retention.spans),
+                ("http_exchanges", self.storage.retention.http_exchanges),
+            ] {
+                if days > 0 && sg.body_retention_days > days {
+                    issues.push(ConfigIssue::SglakeBodyRetentionExceedsParent {
+                        body_days: sg.body_retention_days,
+                        parent: parent.to_string(),
+                        parent_days: days,
+                    });
+                }
+            }
         }
 
         if self.storage.backend == "duckdb" {
@@ -1847,6 +2192,326 @@ mod phase2_tests {
         let cfg = AppConfig::from_toml(&toml);
         let issues = cfg.validate();
         assert!(issues.is_empty(), "expected no issues, got {issues:?}");
+    }
+
+    /// The sglake checks must stay dormant for every other backend —
+    /// `[storage.sglake]` carries defaults whether or not it is in use.
+    #[test]
+    fn validate_skips_sglake_checks_on_other_backends() {
+        let cfg = AppConfig::from_toml(
+            r#"
+            [[pipeline]]
+            name = "p"
+            [[pipeline.sources]]
+            type = "pcap"
+            interface = "eth0"
+
+            [storage]
+            backend = "clickhouse"
+
+            [storage.sglake]
+            index_prefix = ""
+            max_event_bytes = 1
+            "#,
+        );
+        assert!(
+            !cfg.validate().iter().any(|i| matches!(
+                i,
+                ConfigIssue::SglakeReservedIndexPrefix { .. }
+                    | ConfigIssue::SglakeEventCapBelowBodyCap { .. }
+            )),
+            "sglake issues leaked into a clickhouse config"
+        );
+    }
+
+    /// An empty prefix yields `_spans`, which sits in sglake's own
+    /// leading-underscore namespace.
+    #[test]
+    fn validate_rejects_unusable_sglake_index_prefix() {
+        for prefix in ["", "_hidden", "Heron", "he ron", "heron-1"] {
+            let cfg = AppConfig::from_toml(&format!(
+                r#"
+                [[pipeline]]
+                name = "p"
+                [[pipeline.sources]]
+                type = "pcap"
+                interface = "eth0"
+
+                [storage]
+                backend = "sglake"
+
+                [storage.sglake]
+                index_prefix = "{prefix}"
+                "#
+            ));
+            assert!(
+                cfg.validate()
+                    .iter()
+                    .any(|i| matches!(i, ConfigIssue::SglakeReservedIndexPrefix { .. })),
+                "accepted unusable prefix {prefix:?}"
+            );
+        }
+
+        // The default prefix, and other plain tokens, must pass.
+        for prefix in ["heron", "heron_prod", "h2"] {
+            let cfg = AppConfig::from_toml(&format!(
+                r#"
+                [[pipeline]]
+                name = "p"
+                [[pipeline.sources]]
+                type = "pcap"
+                interface = "eth0"
+
+                [storage]
+                backend = "sglake"
+
+                [storage.sglake]
+                index_prefix = "{prefix}"
+                "#
+            ));
+            assert!(
+                !cfg.validate()
+                    .iter()
+                    .any(|i| matches!(i, ConfigIssue::SglakeReservedIndexPrefix { .. })),
+                "rejected valid prefix {prefix:?}"
+            );
+        }
+    }
+
+    /// An event ceiling below the body cap drops every full-size body, every
+    /// time — silent steady-state data loss, so it has to be an error.
+    #[test]
+    fn validate_flags_event_cap_below_body_cap() {
+        let cfg = AppConfig::from_toml(
+            r#"
+            [[pipeline]]
+            name = "p"
+            [[pipeline.sources]]
+            type = "pcap"
+            interface = "eth0"
+
+            [storage]
+            backend = "sglake"
+
+            [storage.sglake]
+            max_event_bytes = 1024
+
+            [body_cap]
+            enabled = true
+            head_bytes = 262144
+            tail_bytes = 65536
+            "#,
+        );
+        let issue = cfg
+            .validate()
+            .into_iter()
+            .find(|i| matches!(i, ConfigIssue::SglakeEventCapBelowBodyCap { .. }))
+            .expect("expected the event-cap issue");
+        assert_eq!(issue.severity(), IssueSeverity::Error);
+        assert!(issue.to_string().contains("max_event_bytes"));
+
+        // Storing no bodies removes the constraint entirely.
+        let cfg = AppConfig::from_toml(
+            r#"
+            [[pipeline]]
+            name = "p"
+            [[pipeline.sources]]
+            type = "pcap"
+            interface = "eth0"
+
+            [storage]
+            backend = "sglake"
+
+            [storage.sglake]
+            max_event_bytes = 1024
+            store_bodies = false
+
+            [body_cap]
+            enabled = true
+            head_bytes = 262144
+            tail_bytes = 65536
+            "#,
+        );
+        assert!(!cfg
+            .validate()
+            .iter()
+            .any(|i| matches!(i, ConfigIssue::SglakeEventCapBelowBodyCap { .. })));
+    }
+
+    /// Bodies outliving their span metadata is wasteful but not broken, so it
+    /// warns rather than failing validation.
+    #[test]
+    fn validate_warns_on_orphaned_body_retention() {
+        let cfg = AppConfig::from_toml(
+            r#"
+            [[pipeline]]
+            name = "p"
+            [[pipeline.sources]]
+            type = "pcap"
+            interface = "eth0"
+
+            [storage]
+            backend = "sglake"
+
+            [storage.sglake]
+            body_retention_days = 90
+
+            [storage.retention]
+            spans = 7
+            traces = 7
+            http_exchanges = 3
+            "#,
+        );
+        let issues: Vec<_> = cfg
+            .validate()
+            .into_iter()
+            .filter(|i| matches!(i, ConfigIssue::SglakeBodyRetentionExceedsParent { .. }))
+            .collect();
+        // Bodies sit in two indexes with two different parents; outliving
+        // either one strands bodies, so both have to be reported.
+        assert_eq!(issues.len(), 2, "{issues:?}");
+        assert!(issues.iter().all(|i| i.severity() == IssueSeverity::Warn));
+        let named: Vec<&str> = issues
+            .iter()
+            .map(|i| match i {
+                ConfigIssue::SglakeBodyRetentionExceedsParent { parent, .. } => parent.as_str(),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(named, vec!["spans", "http_exchanges"]);
+
+        // 0 means "inherit", which can never conflict.
+        let cfg = AppConfig::from_toml(
+            r#"
+            [[pipeline]]
+            name = "p"
+            [[pipeline.sources]]
+            type = "pcap"
+            interface = "eth0"
+
+            [storage]
+            backend = "sglake"
+
+            [storage.sglake]
+            body_retention_days = 0
+
+            [storage.retention]
+            spans = 7
+            traces = 7
+            "#,
+        );
+        assert!(!cfg
+            .validate()
+            .iter()
+            .any(|i| matches!(i, ConfigIssue::SglakeBodyRetentionExceedsParent { .. })));
+    }
+
+    #[test]
+    fn loopback_urls_are_accepted_and_anything_else_is_flagged() {
+        for url in [
+            "http://127.0.0.1:5959",
+            "http://localhost:5959",
+            "https://LOCALHOST/",
+            "http://[::1]:5959",
+            "http://127.5.6.7:5959",
+            "http://user:pw@127.0.0.1:5959/x",
+        ] {
+            let host = sglake_url_host(url).unwrap_or_else(|| panic!("no host in {url}"));
+            assert!(
+                is_loopback_host(&host),
+                "{url} -> {host} should be loopback"
+            );
+        }
+        for url in [
+            "http://10.0.0.5:5959",
+            "http://sglog.internal:5959",
+            "http://[2001:db8::1]:5959",
+            "http://0.0.0.0:5959",
+        ] {
+            let host = sglake_url_host(url).unwrap_or_else(|| panic!("no host in {url}"));
+            assert!(
+                !is_loopback_host(&host),
+                "{url} -> {host} should not be loopback"
+            );
+        }
+        // Unparseable input says nothing rather than guessing.
+        assert_eq!(sglake_url_host("not a url"), None);
+    }
+
+    /// The search API has no auth of its own, so where sglogd listens is the
+    /// only thing standing between stored request bodies and the network.
+    #[test]
+    fn a_non_loopback_sglake_url_is_warned_about() {
+        let cfg = AppConfig::from_toml(
+            r#"
+            [[pipeline]]
+            name = "p"
+            [[pipeline.sources]]
+            type = "pcap"
+            interface = "eth0"
+
+            [storage]
+            backend = "sglake"
+
+            [storage.sglake]
+            url = "http://10.0.0.5:5959"
+            "#,
+        );
+        let issue = cfg
+            .validate()
+            .into_iter()
+            .find(|i| matches!(i, ConfigIssue::SglakeUrlNotLoopback { .. }))
+            .expect("expected the loopback warning");
+        assert_eq!(issue.severity(), IssueSeverity::Warn);
+        assert!(
+            issue.to_string().contains("no authentication"),
+            "the message must say why: {issue}"
+        );
+
+        let cfg = AppConfig::from_toml(
+            r#"
+            [[pipeline]]
+            name = "p"
+            [[pipeline.sources]]
+            type = "pcap"
+            interface = "eth0"
+
+            [storage]
+            backend = "sglake"
+
+            [storage.sglake]
+            url = "http://127.0.0.1:5959"
+            "#,
+        );
+        assert!(!cfg
+            .validate()
+            .iter()
+            .any(|i| matches!(i, ConfigIssue::SglakeUrlNotLoopback { .. })));
+    }
+
+    /// Only when sglake is the active backend — an unused `[storage.sglake]`
+    /// block is not a finding.
+    #[test]
+    fn the_loopback_warning_is_scoped_to_the_active_backend() {
+        let cfg = AppConfig::from_toml(
+            r#"
+            [[pipeline]]
+            name = "p"
+            [[pipeline.sources]]
+            type = "pcap"
+            interface = "eth0"
+
+            [storage]
+            backend = "duckdb"
+
+            [storage.sglake]
+            url = "http://10.0.0.5:5959"
+            "#,
+        );
+        assert!(!cfg
+            .validate()
+            .iter()
+            .any(|i| matches!(i, ConfigIssue::SglakeUrlNotLoopback { .. })));
     }
 
     #[test]

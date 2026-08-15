@@ -4,4 +4,5 @@
 
 pub mod backfill_tokens;
 pub mod doctor;
+pub mod sglake_props;
 pub mod validate;

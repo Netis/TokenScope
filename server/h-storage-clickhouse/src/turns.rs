@@ -15,7 +15,7 @@ use serde::Deserialize;
 use h_common::error::{AppError, Result};
 use h_storage::convert::parse_json_string_list;
 use h_storage::query::*;
-use h_turn::{Trace, PairCandidate};
+use h_turn::{PairCandidate, Trace};
 
 use crate::client::{ch_err, insert_all};
 use crate::rows::TurnRow;
@@ -193,7 +193,10 @@ impl ClickHouseBackend {
             query.time_range.end_us,
         )];
         if !query.filter.wire_apis.is_empty() {
-            where_parts.push(format!("wire_api IN ({})", sql_in_list(&query.filter.wire_apis)));
+            where_parts.push(format!(
+                "wire_api IN ({})",
+                sql_in_list(&query.filter.wire_apis)
+            ));
         }
         if !query.filter.models.is_empty() {
             // models_used is a JSON-array String; match if any requested model
@@ -207,7 +210,10 @@ impl ClickHouseBackend {
             where_parts.push(format!("status IN ({})", sql_in_list(&query.statuses)));
         }
         if !query.agent_kinds.is_empty() {
-            where_parts.push(format!("agent_kind IN ({})", sql_in_list(&query.agent_kinds)));
+            where_parts.push(format!(
+                "agent_kind IN ({})",
+                sql_in_list(&query.agent_kinds)
+            ));
         }
         if !query.client_ips.is_empty() {
             where_parts.push(format!("client_ip IN ({})", sql_in_list(&query.client_ips)));
@@ -225,7 +231,10 @@ impl ClickHouseBackend {
             ));
         }
         if !query.filter.server_ips.is_empty() {
-            where_parts.push(format!("server_ip IN ({})", sql_in_list(&query.filter.server_ips)));
+            where_parts.push(format!(
+                "server_ip IN ({})",
+                sql_in_list(&query.filter.server_ips)
+            ));
         }
         if !query.include_proxy_hops {
             // Hide the sweeper-folded hops. JSONExtractString returns '' when
@@ -259,7 +268,7 @@ impl ClickHouseBackend {
              user_input_preview, final_answer_preview, client_ip, server_ip, metadata, \
              tool_surfaces_json, tool_call_total, agent_topology, suspicious_skills_json \
              FROM traces FINAL WHERE {where_sql} \
-             ORDER BY {} {sort_order} LIMIT {} OFFSET {offset}",
+             ORDER BY {} {sort_order}, turn_id ASC LIMIT {} OFFSET {offset}",
             query.sort_by, query.page_size,
         );
         let rows = self

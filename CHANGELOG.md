@@ -6,6 +6,43 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.2] — 2026-08-15
+
+### Added
+
+- **sglake (sglog) storage backend.** `[storage] backend = "sglake"` runs the
+  whole console against a Splunk-compatible log platform, alongside DuckDB and
+  ClickHouse — writes over the HTTP Event Collector, reads in SPL, all thirty
+  `StorageBackend` methods. Unlike the SQL backends, stored request and response
+  bodies are full-text searchable (`search index=heron_bodies "SELECT * FROM
+  users"`). Retention is pushed as per-index TTLs rather than `DELETE`, since
+  the store is append-only. `heron sglake-props` prints the index-time
+  extraction stanzas that keep aggregates on the columnar path; they are
+  generated from the event structs themselves, so they cannot drift from the
+  schema. See [docs/design/10-sglake.md](docs/design/10-sglake.md), which also
+  documents the known divergences — proxy pairing does not annotate traces on an
+  append-only store.
+
+### Fixed
+
+- **Pagination could return the same row on two pages and skip another.** Every
+  paginated list ordered by a non-unique key (`request_time` most often) with no
+  tie-break, and `LIMIT/OFFSET` issues one query per page, so the engine was
+  free to order tied rows differently between them. Walking 26 spans that shared
+  a timestamp five at a time returned 18 distinct rows. All paginated queries in
+  the DuckDB and ClickHouse backends now end their sort with the row id.
+- **DuckDB truncated `duration_ms` on HTTP exchanges to whole milliseconds**, so
+  every sub-millisecond exchange showed `0.0`. ClickHouse already computed it
+  from microseconds.
+- **`/api/metrics/timeseries` could be asked for an unbounded number of
+  buckets** — a 7-day window at 10s granularity materialises 60,480 points per
+  series. It now refuses above 20,000 and names a granularity that fits.
+
+### Changed
+
+- The agent-trace panel switches to lazy per-call body loading above 50 calls
+  rather than 200, measured against the real cost of answering with bodies.
+
 ## [0.7.1] — 2026-06-24
 
 ### Fixed

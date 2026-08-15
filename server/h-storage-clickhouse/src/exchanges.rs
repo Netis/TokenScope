@@ -186,7 +186,7 @@ impl ClickHouseBackend {
                         - toUnixTimestamp64Micro(request_time)) / 1000.0 \
                   ELSE NULL END AS duration_ms \
              FROM http_exchanges WHERE {where_sql} \
-             ORDER BY {order_expr} {sort_order} \
+             ORDER BY {order_expr} {sort_order}, id ASC \
              LIMIT {} OFFSET {offset}",
             query.page_size,
         );
