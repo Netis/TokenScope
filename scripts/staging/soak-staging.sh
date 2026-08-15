@@ -39,8 +39,8 @@
 #                          still flags relative regressions meanwhile)
 #
 # After the correctness soak passes, a deeper sustained-LOAD soak runs (steady
-# rate_pps replay; perf + reliability invariants). It is informational by
-# default — see HERON_STAGE_LOAD_ENFORCE.
+# rate_pps replay; perf + reliability invariants). Informational by default;
+# staging-soak.yml passes HERON_STAGE_LOAD_ENFORCE=1, so in CI it gates.
 #
 # Exit: 0 pass · 1 candidate regressed · 2 setup error. A tara `harness_broken`
 # (baseline itself failed → corpus/env problem, never the candidate) is logged
@@ -106,12 +106,19 @@ case "$rc" in
     # Deeper check: a sustained-load soak (steady rate_pps replay for a window),
     # asserting perf + reliability invariants — queue depth bounded, zero
     # backpressure drops, RSS growth bounded, no flush errors. Runs only after
-    # the correctness soak is green. INFORMATIONAL by default: the absolute
-    # queue/RSS thresholds still need one calibration pass on this VM's CPU, so
-    # a load regression is logged + warned but does NOT fail the deploy yet (the
-    # dual-binary baseline still flags a *relative* regression). Flip to a hard
-    # gate with HERON_STAGE_LOAD_ENFORCE=1 once calibrated.
-    echo "==> running tara LOAD soak inside the VM (informational)"
+    # the correctness soak is green. Informational until the absolute queue/RSS
+    # thresholds get a calibration pass on a given VM's CPU; the dual-binary
+    # baseline flags *relative* regressions meanwhile. HERON_STAGE_LOAD_ENFORCE=1
+    # makes it a hard gate — which is what staging-soak.yml passes.
+    #
+    # Say which of the two this run is. The line used to read "(informational)"
+    # unconditionally, so an operator reading a log from an enforcing run was
+    # told a load failure would not have blocked the deploy, when it would have.
+    if [ "${HERON_STAGE_LOAD_ENFORCE:-0}" = 1 ]; then
+      echo "==> running tara LOAD soak inside the VM (ENFORCING — a regression fails the deploy)"
+    else
+      echo "==> running tara LOAD soak inside the VM (informational — set HERON_STAGE_LOAD_ENFORCE=1 to gate)"
+    fi
     set +e
     remote "cd $RD && bash tara.sh --binary '$STAGE_BIN' --corpus '$CORPUS_VM' $base_arg --load --duration ${HERON_STAGE_LOAD_SECS:-45} --rate-pps ${HERON_STAGE_LOAD_PPS:-500} --json-out $RD/load.json"
     lrc=$?
