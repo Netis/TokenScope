@@ -206,15 +206,37 @@ jobs:
         run: bun run build
 
       # The staging build ships the `ebpf` feature so the staging VM can validate
-      # on-host SSL-uprobe capture before prod is allowed to deploy (see the
-      # ebpf-soak gate). That out-of-band BPF program build (h-capture/build.rs →
-      # h-ebpf-prog) needs a nightly toolchain with rust-src (for `-Z build-std`)
-      # and bpf-linker. Idempotent on the self-hosted runner: nightly install is
-      # a fast no-op when present; bpf-linker is guarded so it compiles only once.
+      # on-host SSL-uprobe capture before a release can be cut from that commit
+      # (see the ebpf-soak gate). That out-of-band BPF program build
+      # (h-capture/build.rs → h-ebpf-prog) needs a nightly toolchain with
+      # rust-src (for `-Z build-std`) and bpf-linker. Both installs are guarded
+      # so they run once on a given runner rather than on every build.
+      #
+      # The nightly guard is not a micro-optimisation. `rustup toolchain install
+      # nightly` is a no-op only while nightly has not rolled — and it rolls
+      # daily, so the first main build of each day re-downloaded a few hundred MB
+      # of toolchain plus rust-src. On a runner whose link to
+      # static.rust-lang.org is slow that download IS the build: measured at
+      # 10-20 KB/s on this pool, it sat on this step for the better part of an
+      # hour with the step name as the only clue, holding the single runner and
+      # blocking the deploy-staging → soak → release chain behind it. A nightly
+      # already on the runner is one that has built this successfully before, so
+      # reusing it is the more reproducible choice too; force a refresh with
+      # `rustup toolchain uninstall nightly` on the runner.
+      #
+      # A runner on a slow link should additionally point rustup at a mirror
+      # (RUSTUP_DIST_SERVER / RUSTUP_UPDATE_ROOT in the runner service's
+      # environment). That belongs to the runner, not to this file — the right
+      # mirror is a property of where the runner sits, not of the project.
       - name: provision eBPF build toolchain (staging artifact)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: |
-          rustup toolchain install nightly --component rust-src --profile minimal
+          if rustup toolchain list | grep -q '^nightly'; then
+            echo "nightly already present: $(rustup toolchain list | grep '^nightly' | head -1)"
+          else
+            echo "no nightly toolchain; installing…"
+            rustup toolchain install nightly --component rust-src --profile minimal
+          fi
           if ! command -v bpf-linker >/dev/null 2>&1; then
             echo "bpf-linker not found; installing…"
             cargo install bpf-linker --locked

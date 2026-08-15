@@ -30,8 +30,10 @@ jobs:
     runs-on: [self-hosted, staging-deploy]
     timeout-minutes: 15
     # statuses:write lets the final step stamp a `staging-soaked` commit
-    # status — the single authoritative "staging is green, safe to promote"
-    # signal an approver checks before approving the prod deployment.
+    # status — the single authoritative "staging is green, safe to release"
+    # signal. release.yml refuses to build a tag whose commit lacks it, and
+    # prod tracks releases, so this status is what stands between a commit and
+    # the production host.
     permissions:
       contents: read
       statuses: write
@@ -52,10 +54,10 @@ jobs:
           HERON_STAGE_LOAD_ENFORCE: ${{ vars.HERON_STAGE_LOAD_ENFORCE || '1' }}
         run: bash scripts/staging/soak-staging.sh
 
-      # Authoritative go/no-go signal for the prod-approval gate. Only the
+      # Authoritative go/no-go signal for the release gate. Only the
       # workflow_run path carries the exact deployed commit; a skipped chain
       # (CI not green) never reaches this job, so a commit with NO
-      # `staging-soaked` status simply hasn't been soaked — don't promote it.
+      # `staging-soaked` status simply hasn't been soaked — don't tag it.
       - name: Stamp `staging-soaked` commit status
         if: ${{ always() && github.event_name == 'workflow_run' }}
         env:
@@ -65,14 +67,14 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           if [ "$OUTCOME" = "success" ]; then
-            state="success"; desc="tara soak passed — safe to promote to prod"
+            state="success"; desc="tara soak passed — safe to release"
           else
-            state="failure"; desc="tara soak ${OUTCOME} — do NOT promote"
+            state="failure"; desc="tara soak ${OUTCOME} — do NOT release"
           fi
           # Stamp via the REST API with curl, NOT `gh`: the staging-deploy runner
           # has curl but no `gh` CLI, so the original `gh api` exited 127 and
           # failed the whole soak workflow — which dropped workflow_run.conclusion
-          # to "failure" and blocked deploy-prod even though the soak PASSED.
+          # to "failure" and blocked promotion even though the soak PASSED.
           # A stamp failure must never fail the soak, so warn-and-continue.
           code=$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
             -H "Authorization: Bearer ${GH_TOKEN}" \
@@ -92,5 +94,5 @@ jobs:
             echo "- commit: \`${SHA}\`"
             echo "- $desc"
             echo ""
-            echo "Promote to prod only when this commit shows \`staging-soaked\` ✅."
+            echo "Tag a release only from a commit that shows \`staging-soaked\` ✅."
           } >> "$GITHUB_STEP_SUMMARY"

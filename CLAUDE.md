@@ -134,20 +134,30 @@ class of past failure has a deterministic gate before it can ship.
   not a false candidate-reject. On pass it stamps a `staging-soaked` commit
   status.
 
-**Before production** — `staging-soak → [manual approval] → deploy-prod`:
-- deploy-prod builds on the prod host, restarts the service, gates on a health
-  check with **automatic rollback**, and supersedes older waiting approvals so
-  the queue can't wedge. The load soak is **enforcing** here — a regression vs
-  known-good blocks the deploy.
+The load soak is **enforcing** at this stage — a regression vs known-good blocks
+the chain rather than merely reporting.
 
-**Before a release** — push a `v*` tag → `release.yml`:
-- A `gate` job refuses to build/publish unless the tagged commit carries a
-  passing `staging-soaked` status, so the multi-arch binaries are never cut from
-  un-soaked code. Cutting a release: `just bump` (the `VERSION` file is the SSOT
-  for the binary's embedded version) → tag `v<version>` on the soaked commit →
-  `release.yml` builds the binaries and creates the Release, keyed by the tag,
-  with notes from the matching `CHANGELOG.md` section. (Tag/`VERSION` agreement
-  is by the `just bump` → tag convention, not yet enforced in the workflow.)
+**To release** — push a `v*` tag → `release.yml`:
+- A `gate` job refuses to build/publish unless the tagged commit carries passing
+  `staging-soaked` **and** `ebpf-soaked` statuses, so the multi-arch binaries are
+  never cut from un-soaked code. Cutting a release: `just bump` (the `VERSION`
+  file is the SSOT for the binary's embedded version) → tag `v<version>` on the
+  soaked commit → `release.yml` builds the binaries and creates the Release,
+  keyed by the tag, with notes from the matching `CHANGELOG.md` section.
+  (Tag/`VERSION` agreement is by the `just bump` → tag convention, not enforced
+  in the workflow — but `deploy-prod.sh` refuses to install a binary whose
+  `--version` disagrees with the tag, so a mismatch stops before prod.)
+
+**Production tracks releases** — `release: published` → `deploy-prod`:
+- Publishing the tag is the approval; there is no second one. deploy-prod
+  downloads the release asset for the host's arch, **verifies its SHA256**,
+  installs it, restarts, and gates on `/api/health` **plus a read-path smoke
+  over every console endpoint** — a backend that comes up and 500s every query
+  passes the health check alone — with **automatic rollback** to the previous
+  binary. Nothing is built on the prod host, so prod runs the exact bytes the
+  release gate validated, at the cost of running only what the release matrix
+  builds (`console`, i.e. pcap capture, not eBPF). Backing prod out of a bad
+  release is `gh workflow run deploy-prod.yml -f tag=<older>`.
 
 **Out of band** — a **nightly longevity soak** (a timer on the staging VM) runs
 the load soak for hours, tracking RSS + on-disk DB size to catch slow leaks /
