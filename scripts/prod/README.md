@@ -1,8 +1,9 @@
 # Production deploy
 
 Production runs **releases**. Publishing a tag is what ships it: `deploy-prod`
-fires on `release: published`, installs the published artifact on the prod host,
-and gates on health plus a read-path smoke, rolling back on failure.
+fires when `release.yml` finishes a tag build, installs the published artifact
+on the prod host, and gates on health plus a read-path smoke, rolling back on
+failure.
 
 ## Chain
 
@@ -15,7 +16,7 @@ tag v* → release.yml
    │        `staging-soaked` ✅ AND `ebpf-soaked` ✅
    └─ builds + publishes the multi-arch binaries
         │
-        ▼  release: published
+        ▼  release.yml completed (success, tag push)
 deploy-prod.yml
    ├─ runs on the `prod-deploy` self-hosted runner ON the prod host
    └─ deploy-prod.sh <tag>

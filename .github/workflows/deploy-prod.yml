@@ -12,11 +12,28 @@ name: deploy-prod
 #   release.yml (gate + build + publish) → deploy-prod (this) → prod on the release
 #
 # Security: runs ONLY on the `prod-deploy` self-hosted runner ON the prod host,
-# and only on `release: published` / manual dispatch — neither of which a fork
-# or PR can raise. The label is not shared with PR CI, so untrusted code never
-# reaches the prod host. The deploy installs the published, checksummed artifact
-# rather than building on the host.
+# and only on the triggers below — none of which a fork or PR can raise. The
+# label is not shared with PR CI, so untrusted code never reaches the prod host.
+# The deploy installs the published, checksummed artifact rather than building
+# on the host.
+#
+# WHY `workflow_run` AND NOT JUST `release: published`. release.yml publishes
+# with the default GITHUB_TOKEN, and GitHub does not start workflow runs from
+# events raised by that token — a deliberate anti-recursion rule. So a release
+# cut by our own pipeline raises `release: published` that nothing receives:
+# the release appeared, prod never moved, and no run failed to say so. Found by
+# cutting v0.7.2 and watching deploy-prod not exist. Chaining off release.yml's
+# completion is not subject to the rule, because the run being observed was
+# started by a human's tag push.
+#
+# `release: published` is KEPT for the other path: a release published by hand
+# in the UI (or by a PAT) does fire it, and should deploy. When both could fire
+# for one release, the concurrency group below serialises them and the second
+# installs the same checksummed bytes — idempotent, not a double-deploy hazard.
 on:
+  workflow_run:
+    workflows: [release]
+    types: [completed]
   release:
     types: [published]
   # Manual lever: redeploy, or pin prod to a specific (e.g. earlier) release.
@@ -39,21 +56,35 @@ jobs:
     timeout-minutes: 20
     permissions:
       contents: read
+    # A workflow_run fires for EVERY release.yml run, including the
+    # artifacts-only workflow_dispatch one that publishes nothing, and
+    # including failed ones. Only a successful tag-push run produced a release.
+    if: >-
+      github.event_name != 'workflow_run' || (
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'push' &&
+        startsWith(github.event.workflow_run.head_branch, 'v')
+      )
     steps:
-      # For `release: published` this checks out the tagged tree, so the deploy
-      # script that runs is the one that shipped with the release.
-      - uses: actions/checkout@v4
-
       - name: resolve release tag
         id: pick
         run: |
-          if [ "${{ github.event_name }}" = "release" ]; then
-            tag="${{ github.event.release.tag_name }}"
-          else
-            tag="${{ github.event.inputs.tag }}"
-          fi
+          case "${{ github.event_name }}" in
+            release)      tag="${{ github.event.release.tag_name }}" ;;
+            # For a tag push, workflow_run's head_branch IS the tag name.
+            workflow_run) tag="${{ github.event.workflow_run.head_branch }}" ;;
+            *)            tag="${{ github.event.inputs.tag }}" ;;
+          esac
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "deploying release: ${tag:-<latest>}"
+
+      # Check out the TAGGED tree, so the deploy script that runs is the one
+      # that shipped with the release. `release` sets GITHUB_SHA to the tag
+      # commit, but `workflow_run` points at the default branch — hence the
+      # explicit ref rather than a bare checkout.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.pick.outputs.tag }}
 
       - name: install the release on prod + gate on health (rollback on failure)
         env:

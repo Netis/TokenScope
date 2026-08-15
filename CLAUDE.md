@@ -148,7 +148,7 @@ the chain rather than merely reporting.
   in the workflow — but `deploy-prod.sh` refuses to install a binary whose
   `--version` disagrees with the tag, so a mismatch stops before prod.)
 
-**Production tracks releases** — `release: published` → `deploy-prod`:
+**Production tracks releases** — `release.yml` succeeds → `deploy-prod`:
 - Publishing the tag is the approval; there is no second one. deploy-prod
   downloads the release asset for the host's arch, **verifies its SHA256**,
   installs it, restarts, and gates on `/api/health` **plus a read-path smoke
@@ -158,6 +158,11 @@ the chain rather than merely reporting.
   release gate validated, at the cost of running only what the release matrix
   builds (`console`, i.e. pcap capture, not eBPF). Backing prod out of a bad
   release is `gh workflow run deploy-prod.yml -f tag=<older>`.
+- The trigger chains off release.yml's **completion**, not `release: published`.
+  A release cut by the pipeline is published with the default `GITHUB_TOKEN`,
+  and GitHub raises no workflow runs from that token's events — so the
+  `release` trigger alone leaves prod silently un-deployed. It is kept for
+  releases published by hand.
 
 **Out of band** — a **nightly longevity soak** (a timer on the staging VM) runs
 the load soak for hours, tracking RSS + on-disk DB size to catch slow leaks /
