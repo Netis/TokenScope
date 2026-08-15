@@ -103,6 +103,15 @@ swaps the binary and restarts the existing unit; it never templates either file.
 The unit must grant capture caps via `AmbientCapabilities=CAP_NET_RAW
 CAP_NET_ADMIN` and set `Restart=on-failure`.
 
+**The config's directory has to be writable by the service user**, not just the
+file. The Settings UI rewrites the config by writing a temp file beside it and
+renaming (so a partial write can never be observed), and both of those need the
+directory. Provision it with `sudo mkdir` and the file will look correct —
+owned by the service user, mode 0600 — while Save & restart fails with
+`config write failed: write config file: Permission denied (os error 13)`.
+Give the whole directory to the service user; 0700 is right when it also holds
+credentials.
+
 ## The gate is two checks, not one
 
 `/api/health` answers whether the process came up and the capture pipeline is
