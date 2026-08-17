@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.3] — 2026-08-17
+
 ### Fixed
 
 - **Opening an agent turn made the timeline wait on every request and response
