@@ -191,11 +191,10 @@ function TabButton({
   )
 }
 
-/// Above this call_count threshold, the calls list switches to lite
-/// mode — server NULLs the four heavy body/header fields so a
-/// mega-turn (hundreds of agentic iterations × hundreds of KB
-/// request_body each) doesn't OOM the browser. Individual call bodies
-/// are still reachable per-card via `useLlmCallDetail`.
+/// Above this call_count threshold the panel never fetches bodies for the
+/// list at all; individual call bodies stay reachable per-card via
+/// `useLlmCallDetail`. Below it they're still fetched, but as a background
+/// upgrade (see below) rather than something the panel waits on.
 ///
 /// The threshold was set from browser-side cost alone, which is only half the
 /// bill. Measured against a live store, a 184-call turn takes ~6s to answer
@@ -207,8 +206,34 @@ const CALLS_LITE_THRESHOLD = 50
 
 export function AgentTurnDetailPanel({ id, onClose }: Props) {
   const { data: turn, isLoading: loadingTurn, isError: errorTurn } = useAgentTurnDetail(id)
+
+  // Two fetches of the same list, and the panel paints off the cheap one.
+  //
+  // `?lite=1` is 140-350x smaller than the body-bearing shape and answers in
+  // ~10 ms against a production store where the full shape takes 0.4-4.8 s
+  // (2-20 MB over the wire, then a main-thread JSON.parse of the same). The
+  // timeline, stats, agent breakdown and every collapsed card are built from
+  // scalars only — none of them reads a body — so making them wait on those
+  // megabytes cost seconds of blank panel for nothing.
+  //
+  // Three views DO derive from bodies: the timeline's call-type icons,
+  // StatsCards' tool/text/final counts, and the tool index. They upgrade in
+  // place when `bodiedCalls` lands. Above the threshold it never lands and
+  // they degrade — as they already did before this split, since a turn that
+  // large was fetched lite regardless.
+  //
+  // The lite fetch is unconditional. Deriving *whether to fetch bodies* from
+  // `turn.call_count` means it can't be decided until the detail query
+  // answers, and a query gated on another query's result must not fire on the
+  // default in the meantime: `useAgentTurnCalls(id, liteMode)` did exactly
+  // that, issuing the full-body request for every turn and then abandoning it
+  // when call_count came back over the threshold. `apiFetch` passes no
+  // AbortSignal, so "abandoned" meant the browser still downloaded, parsed and
+  // cached ~20 MB it would never show.
+  const { data: liteCalls = [], isLoading: loadingCalls } = useAgentTurnCalls(id, true)
   const liteMode = (turn?.call_count ?? 0) > CALLS_LITE_THRESHOLD
-  const { data: calls = [], isLoading: loadingCalls } = useAgentTurnCalls(id, liteMode)
+  const { data: bodiedCalls } = useAgentTurnCalls(id, false, turn != null && !liteMode)
+  const calls = bodiedCalls ?? liteCalls
 
   // Call-level proxy-duplicate fold: when two captured calls represent
   // the same LLM round-trip (e.g. client→litellm + litellm→upstream),

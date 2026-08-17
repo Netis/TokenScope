@@ -70,13 +70,21 @@ export function useAgentTurnDetail(id: string | null) {
  * expanded call body in lite mode should fall back to
  * `useLlmCallDetail(callId)` to fetch that one call's full bodies on
  * demand.
+ *
+ * The two shapes are separate cache entries, so a caller can hold both:
+ * lite to paint with, full as a later upgrade. `enabled` exists for that
+ * second one — a query whose desirability isn't known until some other
+ * request answers must not fire in the meantime (see the detail panel).
  */
-export function useAgentTurnCalls(id: string | null, lite = false) {
+export function useAgentTurnCalls(id: string | null, lite = false, enabled = true) {
   return useQuery({
     queryKey: ["agent-turn-calls", id, lite],
-    queryFn: () =>
-      apiFetch<AgentTurnCallItem[]>(`/api/traces/${id}/spans`, lite ? { lite: 1 } : {}),
-    enabled: id != null,
+    // The body-bearing shape runs to tens of MB, and this query goes unobserved
+    // often — the panel closes, the reader clicks straight to the next turn.
+    // Without the signal each of those leaves a full download running.
+    queryFn: ({ signal }) =>
+      apiFetch<AgentTurnCallItem[]>(`/api/traces/${id}/spans`, lite ? { lite: 1 } : {}, { signal }),
+    enabled: id != null && enabled,
   })
 }
 

@@ -12,9 +12,17 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * `signal` is worth passing for any endpoint that can answer with megabytes:
+ * TanStack Query aborts it when a query loses its last observer — the panel
+ * closes, the queryKey changes — and without it the browser downloads, parses
+ * and caches a response nothing will ever render. A KB-scale list can skip it;
+ * the span/body endpoints cannot.
+ */
 export async function apiFetch<T>(
   path: string,
   params?: Record<string, string | number | boolean | undefined>,
+  opts?: { signal?: AbortSignal },
 ): Promise<T> {
   const url = new URL(path, window.location.origin)
   if (params) {
@@ -25,7 +33,7 @@ export async function apiFetch<T>(
     }
   }
 
-  const res = await fetch(`${BASE_URL}${url.pathname}${url.search}`)
+  const res = await fetch(`${BASE_URL}${url.pathname}${url.search}`, { signal: opts?.signal })
   if (!res.ok) {
     const body = await res.json().catch(() => ({ code: res.status, message: res.statusText }))
     throw new ApiError(body.code ?? res.status, body.message ?? res.statusText)

@@ -6,6 +6,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Opening an agent turn made the timeline wait on every request and response
+  body in it.** The detail panel fetched the calls list body-bearing, and the
+  timeline, stat cards, agent breakdown and collapsed cards are built from
+  scalars — none of them reads a body. Measured against a production store, that
+  list is 2–20 MB and 0.4–4.8 s where the same list without bodies is 16–60 KB
+  and ~10 ms; the panel then parsed those megabytes on the main thread. It now
+  paints off the small shape and pulls bodies afterwards as a background
+  upgrade, so nothing the reader is waiting for is behind them.
+- **Turns over the 50-call threshold fetched the bodies anyway, then threw them
+  away.** Whether to ask for bodies was decided from `call_count`, which arrives
+  from a *different* request — so on mount the answer defaulted to "yes" and the
+  body-bearing fetch went out for every turn, to be abandoned a few ms later
+  when the count came back over the threshold. `apiFetch` passed no
+  `AbortSignal`, so "abandoned" still meant downloading, parsing and caching the
+  full response: a 102-call turn pulled 20.6 MB it could never render. The span
+  and body endpoints now pass the signal, and the query no longer fires before
+  its own precondition is known — the same turn now costs 60 KB to open.
+
 ## [0.7.2] — 2026-08-15
 
 ### Added
