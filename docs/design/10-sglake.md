@@ -302,12 +302,51 @@ magnitude below this, and this guard is what stands in when it is disabled.
 
 ## Deployment
 
-Two daemon flags Heron cannot set:
+Three daemon flags Heron cannot set:
 
 * **`--max-hot-raw-mib 2048` or more.** The 64 MiB default seals a bucket every
   few hundred spans, and search cost scales with how many buckets a query must
   open. At 2048 MiB, 124k spans produced 12 warm buckets.
+* **`--max-hot-span-hours 6`** (default 2160 h = 90 days). Set this, or the size
+  knob above will starve the small indexes. See below — it is the one flag whose
+  omission produces a slow console rather than a large one.
 * **`--splunk-web-dir <assets>`**, only if you want Heron to manage retention.
+
+### The size knob is global, and Heron's indexes are not the same size
+
+`--max-hot-raw-mib` is per daemon, and it decides when a *hot* bucket seals.
+An inverted index (`index.tsidx`), bloom filter and time index are written when
+that seal happens — a hot bucket has none of them, only `journal.sgj` and its
+WAL. To serve a search over a hot bucket, sglogd builds an index for it in
+memory, and Heron appends every `flush_interval_ms`, so that structure is
+invalidated about as fast as it is built.
+
+`heron_bodies` carries ~200 KB events and seals every few hours on size alone,
+so nearly all of it is warm and indexed. `heron_spans` carries scalars — a
+production instance accumulated 135 MB of raw spans in three days, which reaches
+2048 MiB in about seven weeks, and 90 days of span is further still. **The
+metadata index is the one that never gets an on-disk index**, which is the
+opposite of what the bucket-count analysis above would lead you to expect.
+
+Measured against that instance, both indexes hot and unsealed, under live
+ingest:
+
+| index | hot `journal.sgj` | point lookup | `stats count` |
+|---|---|---|---|
+| `heron_traces` | 3.4 MB | 65 ms, no outliers | 82 ms |
+| `heron_spans` | 22 MB | 12 ms, **spiking to 2.2 s** | 4.2 s |
+
+Same code path and the same absent tsidx in both rows; the only variable is how
+much journal the in-memory build has to cover. At 3.4 MB the rebuild is invisible
+and at 22 MB it is the dominant cost of opening an agent turn — polling once a
+second, ~40% of lookups paid it. It is invariant in the ways that mislead: the
+same for a 1-call turn as an 85-call one, and the same whether the search window
+is the turn's own span, ±24 h, or unbounded.
+
+Keeping the hot bucket small is the fix, and only `--max-hot-span-hours` does
+that for an index whose events are small. At 6 h, `heron_spans` seals four
+buckets a day — 120 over a 30-day retention, against the hundreds of thousands
+the bucket-count guidance is about.
 
 And one property to check: sglake's `/api/v1/*` search endpoints have **no
 authentication**. Where sglogd listens is the entire access-control story for
