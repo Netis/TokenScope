@@ -54,6 +54,21 @@ jobs:
   deploy:
     runs-on: [self-hosted, prod-deploy]
     timeout-minutes: 20
+    # For the RECORD, not for an approval. Naming an environment is the only
+    # thing that makes GitHub log a deployment, so this is what keeps the repo's
+    # Environments panel showing which release prod is actually on. #192 dropped
+    # this line along with the approval it used to carry, and the panel has been
+    # frozen on a stale entry ever since.
+    #
+    # The `production` environment therefore carries NO protection rules. It
+    # required a reviewer back when approving here WAS the gate; #192 moved the
+    # gate to the tag — release.yml refuses to build a commit that is not both
+    # `staging-soaked` and `ebpf-soaked` — so a rule left here gates nothing and
+    # only parks the run. Parking is not free: GitHub fails a deployment left
+    # waiting 30 days, so an un-approved run turns red a month after prod
+    # already shipped, and the panel reports a failure that never ran a step.
+    # That is precisely what the 2026-06-23 run did. Do not re-add reviewers.
+    environment: production
     permissions:
       contents: read
     # A workflow_run fires for EVERY release.yml run, including the
